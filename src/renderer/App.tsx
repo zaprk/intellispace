@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { io, Socket } from 'socket.io-client';
 import { 
   Brain, 
   Settings, 
@@ -14,7 +15,14 @@ import {
   Loader,
   AlertCircle,
   Check,
-  RefreshCw
+  RefreshCw,
+  Play,
+  Users,
+  Clock,
+  CheckCircle,
+  Trash2,
+  User,
+  MessageSquare
 } from 'lucide-react';
 
 // Type definitions
@@ -59,9 +67,8 @@ interface Memory {
   [key: string]: any;
 }
 
-// WebSocket and API configuration
+// API configuration
 const API_URL = 'http://localhost:3001/api';
-const WS_URL = 'ws://localhost:3001';
 
 // Theme definition
 const theme = {
@@ -253,6 +260,19 @@ class ApiService {
       return await response.json();
     } catch (error) {
       console.error('Error updating memory:', error);
+      throw error;
+    }
+  }
+
+  async reloadAgents(): Promise<void> {
+    try {
+      const response = await fetch(`${API_URL}/agents/reload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      if (!response.ok) throw new Error('Failed to reload agents');
+    } catch (error) {
+      console.error('Error reloading agents:', error);
       throw error;
     }
   }
@@ -566,6 +586,7 @@ export default function App() {
   const [conversationMemory, setConversationMemory] = useState<Memory>({});
   const [isProcessing, setIsProcessing] = useState(false);
   const [showAgentModal, setShowAgentModal] = useState(false);
+  const [showTeamTester, setShowTeamTester] = useState(false);
   const [newAgent, setNewAgent] = useState({
     name: '',
     role: '',
@@ -576,51 +597,86 @@ export default function App() {
     systemPrompt: ''
   });
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<Socket | null>(null);
 
-  // Initialize WebSocket connection
+  // Initialize Socket.IO connection
   useEffect(() => {
-    const ws = new WebSocket(WS_URL);
+    console.log('🔌 Connecting to Socket.IO server...');
     
-    ws.onopen = () => {
-      console.log('WebSocket connected');
-      if (activeConversation) {
-        ws.send(JSON.stringify({ 
-          type: 'join', 
-          conversationId: activeConversation 
-        }));
-      }
-    };
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    const socket = io('http://localhost:3001', {
+      transports: ['websocket', 'polling'],
+      timeout: 20000,
+      forceNew: true,
+      autoConnect: true
+    });
+    
+    socket.on('connect', () => {
+      console.log('✅ Socket.IO connected!', socket.id);
       
-      switch (data.type) {
-        case 'new-message':
-          setMessages(prev => [...prev, data.message]);
-          break;
-        case 'typing-indicator':
-          // Handle typing indicator
-          break;
-        case 'agent-status':
-          setAgents(prev => prev.map(agent => 
-            agent.id === data.agentId 
-              ? { ...agent, status: data.status }
-              : agent
-          ));
-          break;
+      // Join the active conversation if one exists
+      if (activeConversation) {
+        socket.emit('join', { 
+          conversationId: activeConversation 
+        });
       }
-    };
+    });
 
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-      setError('Connection error. Please refresh the page.');
-    };
+    socket.on('disconnect', (reason) => {
+      console.log('❌ Socket.IO disconnected:', reason);
+      if (reason === 'io server disconnect') {
+        // Server disconnected, try to reconnect
+        socket.connect();
+      }
+    });
 
-    wsRef.current = ws;
+    socket.on('connect_error', (error) => {
+      console.error('🚨 Socket.IO connection error:', error);
+      setError(`Connection error: ${error.message}. Please check if the backend is running.`);
+    });
+
+    // Handle incoming messages
+    socket.on('new-message', (message: Message) => {
+      console.log('📨 New message received:', message);
+      setMessages(prev => [...prev, message]);
+    });
+
+    // Handle typing indicators
+    socket.on('typing-indicator', (data: { conversationId: string; agentId: string; isTyping: boolean }) => {
+      console.log('⌨️ Typing indicator:', data);
+      // Update UI to show typing indicator
+    });
+
+    // Handle agent status updates
+    socket.on('agent-status', (data: { agentId: string; status: string }) => {
+      console.log('🤖 Agent status update:', data);
+      setAgents(prev => prev.map(agent => 
+        agent.id === data.agentId 
+          ? { ...agent, status: data.status as any }
+          : agent
+      ));
+    });
+
+    // Handle memory updates
+    socket.on('memory-updated', (data: { scope: string; scopeId: string; memory: any }) => {
+      console.log('🧠 Memory updated:', data);
+      if (data.scope === 'conversation' && data.scopeId === activeConversation) {
+        setConversationMemory(data.memory);
+      } else if (data.scope === 'project') {
+        setProjectMemory(data.memory);
+      }
+    });
+
+    // Handle errors
+    socket.on('error', (error: any) => {
+      console.error('🚨 Socket error:', error);
+      setError(`Server error: ${error.message}`);
+    });
+
+    socketRef.current = socket;
 
     return () => {
-      ws.close();
+      console.log('🔌 Cleaning up Socket.IO connection');
+      socket.disconnect();
     };
   }, [activeConversation]);
 
@@ -663,10 +719,12 @@ export default function App() {
         agentsData = [];
       }
 
-      setAgents(agentsData.map(agent => ({
+      const agentsWithStatus = agentsData.map(agent => ({
         ...agent,
-        status: 'online'
-      })));
+        status: 'online' as const
+      }));
+      console.log('🤖 Loaded agents:', agentsWithStatus);
+      setAgents(agentsWithStatus);
 
       // Load conversations
       let conversationsData: Conversation[] = [];
@@ -700,6 +758,18 @@ export default function App() {
   const loadConversationMessages = async (conversationId: string) => {
     try {
       const messagesData = await apiService.fetchMessages(conversationId);
+      console.log('📨 Loaded messages:', messagesData);
+      console.log('🤖 Available agents:', agents);
+      
+      // Check for any messages with unknown senderIds
+      const unknownSenders = messagesData.filter(msg => 
+        msg.senderId !== 'user' && !agents.find(a => a.id === msg.senderId)
+      );
+      if (unknownSenders.length > 0) {
+        console.warn('⚠️ Messages with unknown senderIds:', unknownSenders);
+        console.warn('🤖 Available agent IDs:', agents.map(a => a.id));
+      }
+      
       setMessages(messagesData);
       
       // Load conversation memory
@@ -711,8 +781,12 @@ export default function App() {
     }
   };
 
+  // Handle conversation changes and Socket.IO room joining
   useEffect(() => {
-    if (activeConversation) {
+    if (activeConversation && socketRef.current) {
+      // Join the new conversation room
+      socketRef.current.emit('join', { conversationId: activeConversation });
+      // Load messages for the conversation
       loadConversationMessages(activeConversation);
     }
   }, [activeConversation]);
@@ -865,118 +939,368 @@ export default function App() {
       // Clear existing agents first (except system/user)
       await clearAllAgents();
       
-      const websiteTeam = [
+      const enhancedWebTeam = [
+        // 1. COORDINATOR AGENT - The missing piece!
+        {
+          name: 'Project Coordinator',
+          role: 'coordinator',
+          description: 'Coordinates tasks between team members, manages project workflow, and delegates user requests',
+          config: {
+            llmProvider: 'ollama',
+            model: 'llama3',
+            temperature: 0.3, // Lower temperature for more consistent coordination
+            maxTokens: 4000,
+            systemPrompt: `You are a Project Coordinator for a web development team. Your primary role is to orchestrate collaboration between team members.
+
+COLLABORATION APPROACH:
+- **Natural Triggers**: Use phrases like "I need input from @designer on the user flow" or "Let's work together on this"
+- **Build on Ideas**: Reference what others have said and expand on their contributions
+- **Facilitate Discussion**: Encourage team members to share their expertise
+- **Coordinate Workflow**: Guide the natural flow from design → frontend → backend
+
+TEAM MEMBERS:
+- UI/UX Designer: Creates designs, wireframes, mockups, user flows
+- Frontend Developer: Implements UI, handles client-side logic, React/HTML/CSS  
+- Backend Developer: Creates APIs, database design, server logic, business logic
+
+COLLABORATION PATTERNS:
+1. **Initial Analysis**: "Based on the user request, I think we need to collaborate on..."
+2. **Natural Delegation**: "I need @designer to help with the user experience flow"
+3. **Progress Updates**: "Great work from @frontend on the UI. Now we need @backend for the API"
+4. **Integration**: "Let's coordinate between @designer and @frontend on the component design"
+
+RESPONSE STYLE:
+- Be conversational and collaborative
+- Acknowledge team members' contributions
+- Use natural language to trigger collaboration
+- Reference conversation memory for context
+- Suggest next steps that involve other team members
+
+Example collaboration:
+"I see we need a restaurant website. Let me coordinate with our team:
+
+**Immediate Actions:**
+@designer: Create wireframes for homepage, menu page, and reservation form by end of day
+@frontend: Confirm if you prefer React with Tailwind CSS for this project
+@backend: Design the menu API endpoints and reservation system database schema
+
+**Timeline:** Design → Frontend → Backend integration → Testing
+
+Let's work together to make this restaurant website stand out!"
+
+Remember: You're facilitating natural collaboration, not just delegating tasks.`
+          }
+        },
+
+        // 2. ENHANCED UI/UX DESIGNER
         {
           name: 'UI/UX Designer',
           role: 'designer',
-          description: 'Creates UI/UX designs, wireframes, and visual mockups',
+          description: 'Creates comprehensive UI/UX designs, wireframes, and design systems',
           config: {
             llmProvider: 'ollama',
             model: 'llama3',
             temperature: 0.8,
             maxTokens: 4000,
-            systemPrompt: `You are a professional UI/UX designer. Your role is to:
-- Create detailed design specifications
-- Provide wireframes and mockups
-- Define color schemes, typography, and layout
-- Ensure user experience best practices
-- Collaborate with frontend and backend developers
-- Provide clear design requirements and specifications
+            systemPrompt: `You are a professional UI/UX Designer working in a collaborative web development team.
 
-When working on projects:
-1. Start by understanding the requirements
-2. Create a design brief with key elements
-3. Provide specific design specifications
-4. Include layout, colors, typography, and interactions
-5. Work with the team to ensure feasibility
+COLLABORATION APPROACH:
+- **Natural Communication**: Use phrases like "I need to coordinate with @frontend on the implementation" or "Let's work together on this design"
+- **Build on Context**: Reference what others have said and design accordingly
+- **Share Expertise**: Offer design insights that help the team
+- **Request Input**: Ask for technical feedback from @frontend and @backend when needed
 
-Always communicate clearly with your team members and ask questions when you need clarification.`
+YOUR ROLE:
+- Create detailed design specifications and wireframes
+- Design user flows and information architecture
+- Establish design systems (colors, typography, components)
+- Ensure accessibility and usability best practices
+- Collaborate with frontend developers on implementation feasibility
+- Respond to design feedback and iterate on designs
+
+DESIGN PROCESS:
+1. **Requirements Analysis**: Understand user needs and business goals
+2. **User Research**: Consider user personas and use cases
+3. **Wireframing**: Create low-fidelity layouts and user flows
+4. **Visual Design**: Apply colors, typography, spacing, and branding
+5. **Prototyping**: Define interactions and micro-animations
+6. **Specifications**: Provide detailed specs for developers
+
+COLLABORATION PATTERNS:
+- "I'll create the design system, then we can work with @frontend on implementation"
+- "This design approach would work well with @backend's API structure"
+- "Let me coordinate with @coordinator on the project requirements"
+- "I need input from @frontend on the technical feasibility of this interaction"
+
+RESPONSE STYLE:
+- Be collaborative and open to feedback
+- Reference team members naturally in your responses
+- Suggest how your design work enables others' contributions
+- Use conversation memory to build on previous discussions
+- Update shared memory with design decisions and asset locations
+
+DELIVERABLES FORMAT:
+When providing designs, include:
+- **Component Specifications**: Exact dimensions, colors, typography
+- **User Flow**: Step-by-step user journey
+- **Responsive Behavior**: Mobile, tablet, desktop considerations
+- **Accessibility Notes**: ARIA labels, contrast ratios, keyboard navigation
+- **Asset Requirements**: Images, icons, fonts needed
+
+COMMUNICATION STYLE:
+- Be specific about design requirements
+- Ask clarifying questions about user needs
+- Provide rationale for design decisions
+- Collaborate openly with team members
+
+Example response:
+"Based on the login page requirement, I'll create:
+1. User flow wireframe (login → dashboard)
+2. Component specifications (form fields, buttons, validation states)
+3. Responsive layout for mobile/desktop
+4. Accessibility considerations for screen readers
+
+@frontend: I'll need to know your preferred CSS framework for optimal component design
+@coordinator: Should we include social login options in this iteration?"`
           }
         },
+
+        // 3. ENHANCED FRONTEND DEVELOPER
         {
           name: 'Frontend Developer',
           role: 'frontend-developer',
-          description: 'Implements user interfaces using HTML, CSS, JavaScript, and React',
+          description: 'Implements modern, responsive user interfaces with React and modern frontend technologies',
           config: {
             llmProvider: 'ollama',
             model: 'llama3',
             temperature: 0.6,
             maxTokens: 4000,
-            systemPrompt: `You are a professional frontend developer. Your role is to:
-- Implement user interfaces based on design specifications
-- Write clean, responsive HTML, CSS, and JavaScript
-- Use modern frameworks like React when appropriate
-- Ensure cross-browser compatibility
-- Optimize for performance and accessibility
-- Collaborate with designers and backend developers
+            systemPrompt: `You are a professional Frontend Developer working in a collaborative web development team.
 
-When working on projects:
-1. Review design specifications carefully
-2. Ask clarifying questions about interactions
-3. Implement the interface step by step
-4. Provide code snippets and explanations
-5. Coordinate with backend for API integration
-6. Ensure responsive and accessible design
+COLLABORATION APPROACH:
+- **Natural Communication**: Use phrases like "I need to coordinate with @designer on the component specs" or "Let's work together on this implementation"
+- **Build on Context**: Reference what others have said and implement accordingly
+- **Share Expertise**: Offer technical insights that help the team
+- **Request Input**: Ask for design feedback from @designer and API details from @backend
 
-Always communicate with your team and ask for clarification when needed.`
+YOUR EXPERTISE:
+- React/TypeScript development with modern hooks and state management
+- CSS/Sass/Styled-components for responsive, accessible designs
+- Frontend build tools (Vite, Webpack) and package management
+- Performance optimization and code splitting
+- Testing with Jest/React Testing Library
+- API integration and state management (Redux, Zustand, React Query)
+
+DEVELOPMENT APPROACH:
+1. **Component Architecture**: Create reusable, maintainable components
+2. **Responsive Design**: Mobile-first, cross-browser compatibility
+3. **Performance**: Code splitting, lazy loading, optimization
+4. **Accessibility**: ARIA labels, keyboard navigation, screen reader support
+5. **Testing**: Unit tests for components and integration tests
+6. **Code Quality**: Clean, documented, maintainable code
+
+COLLABORATION PATTERNS:
+- "I'll implement the design from @designer, then coordinate with @backend for API integration"
+- "This component structure would work well with @backend's data format"
+- "I need clarification from @designer on the responsive behavior"
+- "Let me coordinate with @coordinator on the implementation timeline"
+
+RESPONSE STYLE:
+- Be collaborative and open to feedback
+- Reference team members naturally in your responses
+- Suggest how your implementation enables others' work
+- Use conversation memory to build on previous discussions
+- Ask for input when you need design or API details
+
+COLLABORATION WORKFLOW:
+- Implement designs provided by @designer with pixel-perfect accuracy
+- Coordinate with @backend for API integration and data structures
+- Report to @coordinator on progress and any blockers
+- Update shared memory with component documentation and API requirements
+
+DELIVERABLES:
+- Clean, commented React/TypeScript code
+- Responsive CSS with mobile-first approach
+- Component documentation and usage examples
+- Integration with backend APIs
+- Performance metrics and optimization notes
+
+Example collaboration:
+"I'll implement the dashboard based on @designer's specifications. I need to coordinate with @backend on the API endpoints for user data and menu items. Let's work together to ensure the frontend and backend integrate smoothly!"
+
+**Dependencies:**
+@backend: Need user data API endpoints (/api/user/profile, /api/dashboard/stats)
+@designer: Confirm mobile navigation pattern (hamburger vs bottom tabs)
+
+**Implementation:**
+\`\`\`tsx
+const Dashboard = () => {
+  const { user } = useAuth();
+  const { data, loading } = useQuery('/api/dashboard/stats');
+  
+  return (
+    <DashboardLayout>
+      <UserProfile user={user} />
+      <NavigationSidebar />
+      <DataVisualization data={data} loading={loading} />
+    </DashboardLayout>
+  );
+};
+\`\`\`
+
+Timeline: 3-4 days including testing and responsive implementation"`
           }
         },
+
+        // 4. ENHANCED BACKEND DEVELOPER
         {
           name: 'Backend Developer',
           role: 'backend-developer',
-          description: 'Handles server logic, APIs, database design, and business logic',
+          description: 'Designs and implements scalable backend systems, APIs, and database architecture',
           config: {
             llmProvider: 'ollama',
             model: 'llama3',
             temperature: 0.5,
             maxTokens: 4000,
-            systemPrompt: `You are a professional backend developer. Your role is to:
-- Design and implement APIs
-- Design database schemas
-- Handle business logic and data processing
-- Ensure security and performance
-- Provide data structures and endpoints
-- Collaborate with frontend developers
+            systemPrompt: `You are a professional Backend Developer working in a collaborative web development team.
 
-When working on projects:
-1. Understand the project requirements
-2. Design appropriate database schemas
-3. Create API endpoints and documentation
-4. Implement business logic
-5. Ensure security best practices
-6. Coordinate with frontend for integration
-7. Provide clear API specifications
+COLLABORATION APPROACH:
+- **Natural Communication**: Use phrases like "I need to coordinate with @frontend on the API structure" or "Let's work together on this backend architecture"
+- **Build on Context**: Reference what others have said and design accordingly
+- **Share Expertise**: Offer technical insights that help the team
+- **Request Input**: Ask for requirements from @frontend and design considerations from @designer
 
-Always communicate with your team and ask for clarification when needed.`
+YOUR EXPERTISE:
+- API design and implementation (REST, GraphQL)
+- Database design and optimization (PostgreSQL, MongoDB, Redis)
+- Authentication and authorization (JWT, OAuth, RBAC)
+- Server architecture (Node.js, Express, microservices)
+- Security best practices and data protection
+- Performance optimization and caching strategies
+- Testing (unit, integration, load testing)
+
+DEVELOPMENT APPROACH:
+1. **API Design**: RESTful endpoints with clear documentation
+2. **Database Schema**: Normalized, efficient data structures
+3. **Security**: Authentication, authorization, input validation
+4. **Performance**: Caching, indexing, query optimization
+5. **Scalability**: Modular architecture, horizontal scaling considerations
+6. **Documentation**: OpenAPI specs, endpoint documentation
+
+COLLABORATION PATTERNS:
+- "I'll design the API structure, then coordinate with @frontend on the data format"
+- "This database schema would support @designer's data visualization needs"
+- "I need clarification from @frontend on the authentication flow"
+- "Let me coordinate with @coordinator on the backend architecture timeline"
+
+RESPONSE STYLE:
+- Be collaborative and open to feedback
+- Reference team members naturally in your responses
+- Suggest how your backend work enables others' contributions
+- Use conversation memory to build on previous discussions
+- Ask for input when you need frontend or design requirements
+
+COLLABORATION WORKFLOW:
+- Design APIs based on frontend requirements from @frontend
+- Consider data visualization needs from @designer
+- Report progress and technical constraints to @coordinator
+- Update shared memory with API documentation and database schemas
+
+TECHNICAL CONSIDERATIONS:
+- Design APIs that support frontend state management patterns
+- Plan for real-time features (WebSockets, SSE) when needed
+- Consider mobile app support in API design
+- Implement proper error handling and logging
+
+Example collaboration:
+"I'll design the restaurant API structure based on the requirements. I need to coordinate with @frontend on the data format for menu items and reservations. Let's work together to ensure the API supports all the frontend features we discussed!"`
           }
         }
       ];
 
       // Create all agents
       const createdAgents: Agent[] = [];
-      for (const agentData of websiteTeam) {
-        const createdAgent = await apiService.createAgent(agentData);
-        createdAgents.push(createdAgent);
+      for (const agentData of enhancedWebTeam) {
+        console.log('🔄 Creating agent:', agentData.name);
+        try {
+          const createdAgent = await apiService.createAgent(agentData);
+          console.log('✅ Created agent:', createdAgent);
+          createdAgents.push(createdAgent);
+        } catch (error) {
+          console.error('❌ Failed to create agent:', agentData.name, error);
+          throw error;
+        }
       }
 
       // Add all agents to state
       setAgents(prev => [...prev, ...createdAgents.map(agent => ({ ...agent, status: 'online' as const }))]);
+      
+      // Reload agents in the backend orchestrator to ensure they're in memory
+      try {
+        await apiService.reloadAgents();
+        console.log('✅ Reloaded agents in backend orchestrator');
+      } catch (error) {
+        console.warn('⚠️ Could not reload agents in backend:', error);
+      }
 
-      // Create a team conversation
+      // Create a team conversation with proper participant order
       const teamConversation = await apiService.createConversation({
         projectId: 'default',
-        name: 'Website Development Team',
+        name: 'Web Development Team - Enhanced',
         type: 'group',
-        participants: createdAgents.map(a => a.id)
+        participants: [
+          'user-agent', // User first
+          createdAgents[0].id, // Coordinator second
+          ...createdAgents.slice(1).map(a => a.id) // Then specialists
+        ]
       });
 
       setConversations(prev => [...prev, teamConversation]);
       setActiveConversation(teamConversation.id);
-      setActiveAgent(createdAgents[0].id);
+      setActiveAgent(createdAgents[0].id); // Start with coordinator
+
+      // Initialize shared workspace memory
+      const initialWorkspace = {
+        project: {
+          name: "Web Development Project",
+          status: "planning",
+          created: new Date().toISOString(),
+          team: {
+            coordinator: createdAgents[0].id,
+            designer: createdAgents[1].id,
+            frontend: createdAgents[2].id,
+            backend: createdAgents[3].id
+          }
+        },
+        requirements: {},
+        design: {
+          wireframes: {},
+          components: {},
+          designSystem: {}
+        },
+        frontend: {
+          components: {},
+          pages: {},
+          apis: {}
+        },
+        backend: {
+          endpoints: {},
+          database: {},
+          authentication: {}
+        },
+        timeline: {},
+        decisions: []
+      };
+
+      // Update shared memory
+      await apiService.updateMemory('conversation', teamConversation.id, initialWorkspace);
+
+      console.log('Enhanced web development team created successfully!');
+      console.log('Team members:', createdAgents.map(a => `${a.name} (${a.role})`));
 
     } catch (err) {
-      console.error('Error creating website team:', err);
-      setError('Failed to create website development team');
+      console.error('Error creating enhanced web development team:', err);
+      setError('Failed to create enhanced web development team');
     }
   };
 
@@ -1109,6 +1433,18 @@ Always communicate with your team and ask for clarification when needed.`
                 Website Team
               </button>
               <button 
+                style={{
+                  ...styles.addAgentButton,
+                  background: theme.colors.info
+                }}
+                onClick={() => setShowTeamTester(true)}
+                onMouseEnter={(e) => e.currentTarget.style.background = '#4752C4'}
+                onMouseLeave={(e) => e.currentTarget.style.background = theme.colors.info}
+              >
+                <Play size={16} />
+                Test Team
+              </button>
+              <button 
                 style={styles.addAgentButton}
                 onClick={createNewConversation}
                 onMouseEnter={(e) => e.currentTarget.style.background = theme.colors.primaryHover}
@@ -1191,6 +1527,16 @@ Always communicate with your team and ask for clarification when needed.`
                       <Plus size={16} />
                       Create Custom Agent
                     </button>
+                    <button
+                      onClick={() => setShowTeamTester(true)}
+                      style={{
+                        ...styles.addAgentButton,
+                        background: theme.colors.info
+                      }}
+                    >
+                      <Play size={16} />
+                      Test Team Collaboration
+                    </button>
                   </div>
                 </>
               ) : conversations.length === 0 ? (
@@ -1219,14 +1565,41 @@ Always communicate with your team and ask for clarification when needed.`
           {messages.map(message => (
             <div key={message.id} style={styles.message}>
               <div style={styles.messageAvatar}>
-                {message.senderId === 'user' ? '👤' : <Bot size={20} />}
+                {message.senderId === 'user' ? (
+                  '👤'
+                ) : (() => {
+                    const agent = agents.find(a => a.id === message.senderId);
+                    if (agent) {
+                      // Different icons for different roles
+                      const roleIcons: { [key: string]: string } = {
+                        'coordinator': '🎯',
+                        'designer': '🎨',
+                        'frontend-developer': '💻',
+                        'backend-developer': '⚙️',
+                        'ui/ux designer': '🎨',
+                        'project manager': '📋',
+                        'system': '🔧',
+                        'user': '👤'
+                      };
+                      return roleIcons[agent.role.toLowerCase()] || '🤖';
+                    }
+                    return '🤖';
+                  })()}
               </div>
               <div style={styles.messageContent}>
                 <div style={styles.messageHeader}>
                   <span style={styles.messageAuthor}>
                     {message.senderId === 'user' 
                       ? 'You' 
-                      : agents.find(a => a.id === message.senderId)?.name || 'Agent'}
+                      : (() => {
+                          const agent = agents.find(a => a.id === message.senderId);
+                          if (agent) {
+                            return `${agent.name} (${agent.role})`;
+                          } else {
+                            console.warn(`Agent not found for senderId: ${message.senderId}`);
+                            return `Agent (${message.senderId})`;
+                          }
+                        })()}
                   </span>
                   <span style={styles.messageTime}>
                     {new Date(message.timestamp).toLocaleTimeString([], { 
@@ -1553,6 +1926,547 @@ Always communicate with your team and ask for clarification when needed.`
           </div>
         </div>
       )}
+
+      {/* Team Collaboration Tester Modal */}
+      {showTeamTester && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0, 0, 0, 0.8)',
+          zIndex: 1000,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '20px'
+        }}>
+          <div style={{
+            background: theme.colors.background,
+            borderRadius: '12px',
+            width: '100%',
+            maxWidth: '1200px',
+            height: '90vh',
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column'
+          }}>
+            <div style={{
+              padding: '20px',
+              borderBottom: `1px solid ${theme.colors.border}`,
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center'
+            }}>
+              <h2 style={{ color: theme.colors.text, margin: 0, fontSize: '24px' }}>
+                Team Collaboration Tester
+              </h2>
+              <button
+                onClick={() => setShowTeamTester(false)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: theme.colors.text,
+                  cursor: 'pointer',
+                  padding: '8px'
+                }}
+              >
+                <X size={24} />
+              </button>
+            </div>
+                         <div style={{ flex: 1, overflow: 'auto', padding: '20px' }}>
+               <TeamCollaborationTester 
+                 activeConversationId={activeConversation}
+                 agents={agents}
+                 apiService={apiService}
+                 socketRef={socketRef}
+               />
+             </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+// Team Collaboration Tester Component
+interface TestScenario {
+  id: string;
+  name: string;
+  description: string;
+  userMessage: string;
+  expectedFlow: string[];
+  criteria: Record<string, string>;
+}
+
+interface TestResult {
+  status: string;
+  score: number;
+  timestamp: string;
+  flow: any[];
+}
+
+interface TeamStatus {
+  coordinator: 'ready' | 'working' | 'waiting';
+  designer: 'ready' | 'working' | 'waiting';
+  frontend: 'ready' | 'working' | 'waiting';
+  backend: 'ready' | 'working' | 'waiting';
+}
+
+interface TeamCollaborationTesterProps {
+  activeConversationId: string | null;
+  agents: Agent[];
+  apiService: any;
+  socketRef: React.RefObject<Socket | null>;
+}
+
+const TeamCollaborationTester = ({ activeConversationId, agents, apiService, socketRef }: TeamCollaborationTesterProps) => {
+  const [activeTest, setActiveTest] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
+  const [teamStatus, setTeamStatus] = useState<TeamStatus>({
+    coordinator: 'ready',
+    designer: 'ready', 
+    frontend: 'ready',
+    backend: 'ready'
+  });
+  const [sharedMemory, setSharedMemory] = useState({
+    project: {
+      name: "Web Development Project",
+      status: "planning",
+      requirements: {},
+      timeline: {}
+    },
+    currentTask: null,
+    lastUpdate: new Date().toISOString()
+  });
+
+  const testScenarios = [
+    {
+      id: 'project-kickoff',
+      name: '🚀 Project Kickoff',
+      description: 'Test how the team handles initial project requirements',
+      userMessage: 'I need to build a user dashboard for a SaaS application. It should have user authentication, data visualization charts, and a settings page. Users should be able to view their account stats, change their profile information, and see usage analytics.',
+      expectedFlow: [
+        'Coordinator analyzes requirements',
+        'Coordinator delegates tasks to team members',
+        'Designer creates wireframes and user flows',
+        'Backend designs database and API structure',
+        'Frontend plans component architecture'
+      ],
+      criteria: {
+        coordination: 'Coordinator breaks down tasks clearly',
+        design: 'Designer creates comprehensive wireframes',
+        backend: 'Backend designs proper API structure',
+        frontend: 'Frontend plans component hierarchy',
+        collaboration: 'Team members communicate effectively'
+      }
+    },
+    {
+      id: 'feature-request',
+      name: '⚡ Feature Addition',
+      description: 'Test how team handles new feature requests',
+      userMessage: 'Add a real-time notification system to the dashboard. Users should see notifications for important events and be able to mark them as read.',
+      expectedFlow: [
+        'Coordinator assesses impact on existing work',
+        'Backend designs notification data model',
+        'Designer creates notification UI components',
+        'Frontend implements real-time updates',
+        'Team coordinates integration points'
+      ],
+      criteria: {
+        coordination: 'Proper impact assessment and planning',
+        design: 'UI design for notifications',
+        backend: 'Real-time architecture planning',
+        frontend: 'Real-time state management',
+        collaboration: 'Dependency management'
+      }
+    },
+    {
+      id: 'technical-challenge',
+      name: '🔧 Technical Problem',
+      description: 'Test problem-solving and technical discussion',
+      userMessage: 'The dashboard is loading slowly, especially the charts. Users are complaining about performance. How can we optimize this?',
+      expectedFlow: [
+        'Coordinator identifies stakeholders',
+        'Frontend analyzes performance bottlenecks',
+        'Backend reviews API performance',
+        'Designer considers UX improvements',
+        'Team proposes optimization strategy'
+      ],
+      criteria: {
+        coordination: 'Organizes technical investigation',
+        design: 'UX considerations for loading states',
+        backend: 'API and database optimization',
+        frontend: 'Frontend performance optimization',
+        collaboration: 'Holistic solution approach'
+      }
+    },
+    {
+      id: 'design-iteration',
+      name: '🎨 Design Feedback',
+      description: 'Test design collaboration and iteration',
+      userMessage: '@designer The login page design looks good, but can we make it more mobile-friendly? Also, the color scheme needs to match our brand colors (blue: #2563eb, gray: #6b7280).',
+      expectedFlow: [
+        'Designer acknowledges feedback',
+        'Designer proposes mobile-first redesign',
+        'Frontend reviews implementation complexity',
+        'Coordinator tracks design iteration timeline',
+        'Team updates shared design system'
+      ],
+      criteria: {
+        coordination: 'Tracks design changes impact',
+        design: 'Responsive design iteration',
+        backend: 'No backend impact needed',
+        frontend: 'Implementation feasibility review',
+        collaboration: 'Design system consistency'
+      }
+    },
+    {
+      id: 'integration-discussion',
+      name: '🔗 Integration Planning',
+      description: 'Test cross-team technical coordination',
+      userMessage: '@frontend @backend How should we handle user authentication state across page refreshes? Do we store JWT in localStorage or use httpOnly cookies?',
+      expectedFlow: [
+        'Backend explains security implications',
+        'Frontend discusses state management needs',
+        'Coordinator facilitates technical decision',
+        'Team agrees on implementation approach',
+        'Shared memory updated with decision'
+      ],
+      criteria: {
+        coordination: 'Facilitates technical decisions',
+        design: 'UX implications considered',
+        backend: 'Security best practices',
+        frontend: 'State management strategy',
+        collaboration: 'Consensus building'
+      }
+    }
+  ];
+
+  const runTest = async (scenario: TestScenario) => {
+    setActiveTest(scenario.id);
+    
+    // Reset team status to working
+    setTeamStatus({
+      coordinator: 'working',
+      designer: 'working', 
+      frontend: 'working',
+      backend: 'working'
+    });
+
+    const testFlow: any[] = [];
+    let responseCount = 0;
+    let startTime = Date.now();
+    
+    try {
+      // 1. Send the test message via Socket.IO to trigger agent processing
+      if (activeConversationId && socketRef.current) {
+        // Send via Socket.IO to trigger agent orchestration
+        socketRef.current.emit('message', {
+          conversationId: activeConversationId,
+          senderId: 'user',
+          content: scenario.userMessage,
+          type: 'user'
+        });
+        
+        testFlow.push({
+          timestamp: Date.now(),
+          actor: 'user',
+          action: 'message',
+          content: scenario.userMessage
+        });
+
+                 // 2. Monitor for agent responses
+         const checkResponses = () => {
+           // Get current messages from the conversation
+           apiService.fetchMessages(activeConversationId).then((messages: Message[]) => {
+             const recentMessages = messages.filter((m: Message) => 
+               m.timestamp > new Date(startTime).toISOString() && 
+               m.senderId !== 'user'
+             );
+             
+             responseCount = recentMessages.length;
+             
+             // Update test flow with real responses
+             recentMessages.forEach((msg: Message) => {
+               const agent = agents?.find((a: Agent) => a.id === msg.senderId);
+               testFlow.push({
+                 timestamp: Date.now(),
+                 actor: agent?.role || msg.senderId,
+                 action: 'response',
+                 content: msg.content.substring(0, 100) + '...',
+                 fullContent: msg.content
+               });
+             });
+
+            // Check if we have enough responses or timeout
+            if (responseCount >= 3 || Date.now() - startTime > 30000) {
+              // Calculate score based on response quality and coordination
+              const score = calculateTestScore(scenario, testFlow, responseCount);
+              
+              setTeamStatus({
+                coordinator: 'ready',
+                designer: 'ready',
+                backend: 'ready',
+                frontend: 'ready'
+              });
+
+              setTestResults(prev => ({
+                ...prev,
+                [scenario.id]: {
+                  status: 'completed',
+                  score,
+                  timestamp: new Date().toISOString(),
+                  flow: testFlow,
+                  responses: recentMessages
+                }
+              }));
+
+              setActiveTest(null);
+            } else {
+              // Continue monitoring
+              setTimeout(checkResponses, 2000);
+            }
+          });
+        };
+
+        // Start monitoring responses
+        setTimeout(checkResponses, 3000);
+      } else {
+        throw new Error('No active conversation found. Please create a team conversation first.');
+      }
+    } catch (error) {
+      console.error('Test failed:', error);
+      setTeamStatus({
+        coordinator: 'ready',
+        designer: 'ready',
+        backend: 'ready',
+        frontend: 'ready'
+      });
+      setActiveTest(null);
+    }
+  };
+
+  const calculateTestScore = (scenario: TestScenario, flow: any[], responseCount: number): number => {
+    let score = 60; // Base score
+    
+    // Bonus for coordinator response
+    const coordinatorResponse = flow.find(f => f.actor === 'coordinator');
+    if (coordinatorResponse) score += 10;
+    
+    // Bonus for multiple team members responding
+    const uniqueResponders = new Set(flow.filter(f => f.actor !== 'user').map(f => f.actor));
+    score += Math.min(uniqueResponders.size * 5, 15);
+    
+    // Bonus for response count
+    score += Math.min(responseCount * 3, 15);
+    
+    return Math.min(score, 100);
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'ready': return 'text-green-600 bg-green-100';
+      case 'working': return 'text-orange-600 bg-orange-100';
+      case 'waiting': return 'text-gray-600 bg-gray-100';
+      default: return 'text-gray-600 bg-gray-100';
+    }
+  };
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'ready': return <CheckCircle size={16} />;
+      case 'working': return <Clock size={16} className="animate-spin" />;
+      default: return <Clock size={16} />;
+    }
+  };
+
+  return (
+    <div style={{ color: theme.colors.text, maxWidth: '100%' }}>
+      <div style={{ marginBottom: '32px' }}>
+        <h1 style={{ fontSize: '24px', fontWeight: 'bold', marginBottom: '8px' }}>
+          Web Development Team Collaboration Tester
+        </h1>
+        <p style={{ color: theme.colors.textMuted }}>
+          Test how well your Ollama-powered web development team works together on real scenarios.
+        </p>
+      </div>
+
+      {/* Team Status Dashboard */}
+      <div style={{ marginBottom: '32px', padding: '24px', background: theme.colors.backgroundSecondary, borderRadius: '8px' }}>
+        <h2 style={{ fontSize: '20px', fontWeight: '600', marginBottom: '16px', display: 'flex', alignItems: 'center' }}>
+          <Users size={20} style={{ marginRight: '8px' }} />
+          Team Status
+        </h2>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>
+          {Object.entries(teamStatus).map(([role, status]) => (
+            <div key={role} style={{
+              padding: '12px',
+              borderRadius: '8px',
+              border: `1px solid ${theme.colors.border}`,
+              background: status === 'ready' ? 'rgba(59, 165, 93, 0.1)' : 
+                         status === 'working' ? 'rgba(250, 166, 26, 0.1)' : 
+                         'rgba(150, 152, 157, 0.1)',
+              color: status === 'ready' ? '#3ba55d' : 
+                     status === 'working' ? '#faa61a' : 
+                     theme.colors.textMuted
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ fontWeight: '500', textTransform: 'capitalize' }}>{role}</span>
+                {getStatusIcon(status)}
+              </div>
+              <div style={{ fontSize: '14px', marginTop: '4px', textTransform: 'capitalize' }}>{status}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Shared Memory Viewer */}
+      <div style={{ marginBottom: '32px', padding: '24px', background: 'rgba(88, 101, 242, 0.1)', borderRadius: '8px' }}>
+        <h2 style={{ fontSize: '20px', fontWeight: '600', marginBottom: '16px', display: 'flex', alignItems: 'center' }}>
+          <Database size={20} style={{ marginRight: '8px' }} />
+          Shared Workspace Memory
+        </h2>
+        <div style={{ background: theme.colors.backgroundTertiary, padding: '16px', borderRadius: '4px', border: `1px solid ${theme.colors.border}` }}>
+          <pre style={{ fontSize: '14px', color: theme.colors.text, overflow: 'auto', margin: 0 }}>
+            {JSON.stringify(sharedMemory, null, 2)}
+          </pre>
+        </div>
+      </div>
+
+      {/* Test Scenarios */}
+      <div style={{ marginBottom: '32px' }}>
+        <h2 style={{ fontSize: '20px', fontWeight: '600', marginBottom: '16px' }}>Test Scenarios</h2>
+        <div style={{ display: 'grid', gap: '24px' }}>
+          {testScenarios.map((scenario) => (
+            <div key={scenario.id} style={{
+              border: `1px solid ${theme.colors.border}`,
+              borderRadius: '8px',
+              padding: '24px',
+              background: theme.colors.backgroundSecondary
+            }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '16px' }}>
+                <div style={{ flex: 1 }}>
+                  <h3 style={{ fontSize: '18px', fontWeight: '600', marginBottom: '8px' }}>
+                    {scenario.name}
+                  </h3>
+                  <p style={{ color: theme.colors.textMuted, marginBottom: '16px' }}>{scenario.description}</p>
+                  
+                  <div style={{ marginBottom: '16px' }}>
+                    <h4 style={{ fontWeight: '500', marginBottom: '8px' }}>User Message:</h4>
+                    <div style={{ background: theme.colors.backgroundTertiary, padding: '12px', borderRadius: '4px', fontSize: '14px' }}>
+                      {scenario.userMessage}
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: '16px' }}>
+                    <h4 style={{ fontWeight: '500', marginBottom: '8px' }}>Expected Flow:</h4>
+                    <ul style={{ fontSize: '14px', color: theme.colors.textMuted, margin: 0, paddingLeft: '20px' }}>
+                      {scenario.expectedFlow.map((step, index) => (
+                        <li key={index} style={{ marginBottom: '4px' }}>
+                          <span style={{
+                            display: 'inline-block',
+                            width: '20px',
+                            height: '20px',
+                            borderRadius: '50%',
+                            background: 'rgba(88, 101, 242, 0.2)',
+                            color: theme.colors.primary,
+                            fontSize: '12px',
+                            textAlign: 'center',
+                            lineHeight: '20px',
+                            marginRight: '8px'
+                          }}>
+                            {index + 1}
+                          </span>
+                          {step}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+
+                <div style={{ marginLeft: '16px', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                  <button
+                    onClick={() => runTest(scenario)}
+                    disabled={activeTest === scenario.id}
+                    style={{
+                      padding: '8px 16px',
+                      borderRadius: '8px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      border: 'none',
+                      cursor: activeTest === scenario.id ? 'not-allowed' : 'pointer',
+                      background: activeTest === scenario.id ? theme.colors.backgroundTertiary : theme.colors.primary,
+                      color: activeTest === scenario.id ? theme.colors.textMuted : theme.colors.textBright,
+                      opacity: activeTest === scenario.id ? 0.5 : 1
+                    }}
+                  >
+                    <Play size={16} />
+                    <span>{activeTest === scenario.id ? 'Running...' : 'Run Test'}</span>
+                  </button>
+
+                  {testResults[scenario.id] && (
+                    <div style={{ marginTop: '12px', textAlign: 'right' }}>
+                      <div style={{ fontSize: '14px', color: theme.colors.textMuted }}>Last Run</div>
+                      <div style={{
+                        fontSize: '18px',
+                        fontWeight: 'bold',
+                        color: testResults[scenario.id].score >= 90 ? '#3ba55d' : 
+                               testResults[scenario.id].score >= 80 ? '#faa61a' : '#ed4245'
+                      }}>
+                        {testResults[scenario.id].score}%
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '16px', fontSize: '14px' }}>
+                <div>
+                  <h4 style={{ fontWeight: '500', marginBottom: '8px' }}>Success Criteria:</h4>
+                  <ul style={{ color: theme.colors.textMuted, margin: 0, paddingLeft: '20px' }}>
+                    {Object.entries(scenario.criteria).map(([role, criterion]) => (
+                      <li key={role} style={{ marginBottom: '4px' }}>
+                        <span style={{ width: '80px', display: 'inline-block', textTransform: 'capitalize', fontWeight: '500' }}>{role}:</span>
+                        <span>{criterion}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Results Summary */}
+      {Object.keys(testResults).length > 0 && (
+        <div style={{ padding: '24px', background: 'rgba(59, 165, 93, 0.1)', borderRadius: '8px' }}>
+          <h2 style={{ fontSize: '20px', fontWeight: '600', marginBottom: '16px', color: '#3ba55d' }}>Test Results Summary</h2>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>
+            <div style={{ background: theme.colors.backgroundSecondary, padding: '16px', borderRadius: '4px', border: `1px solid ${theme.colors.border}` }}>
+              <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#3ba55d' }}>
+                {Object.keys(testResults).length}
+              </div>
+              <div style={{ fontSize: '14px', color: theme.colors.textMuted }}>Tests Completed</div>
+            </div>
+            <div style={{ background: theme.colors.backgroundSecondary, padding: '16px', borderRadius: '4px', border: `1px solid ${theme.colors.border}` }}>
+              <div style={{ fontSize: '24px', fontWeight: 'bold', color: theme.colors.primary }}>
+                {Math.round(Object.values(testResults).reduce((acc, result) => acc + result.score, 0) / Object.keys(testResults).length || 0)}%
+              </div>
+              <div style={{ fontSize: '14px', color: theme.colors.textMuted }}>Average Score</div>
+            </div>
+            <div style={{ background: theme.colors.backgroundSecondary, padding: '16px', borderRadius: '4px', border: `1px solid ${theme.colors.border}` }}>
+              <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#a855f7' }}>
+                {Object.values(testResults).filter(result => result.score >= 90).length}
+              </div>
+              <div style={{ fontSize: '14px', color: theme.colors.textMuted }}>Excellent Results</div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

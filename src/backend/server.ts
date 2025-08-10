@@ -99,6 +99,16 @@ app.delete('/api/agents/:id', async (req, res) => {
   }
 });
 
+app.post('/api/agents/reload', async (req, res) => {
+  try {
+    await agentOrchestrator.loadAgents();
+    res.json({ success: true, message: 'Agents reloaded successfully' });
+  } catch (error: any) {
+    console.error('Error reloading agents:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ===== Conversation Routes =====
 app.get('/api/conversations', async (req, res) => {
   try {
@@ -349,7 +359,17 @@ app.post('/api/agents/:agentId/trigger', async (req, res) => {
     const { conversationId, prompt } = req.body;
     
     // Don't await - let it process in background
-    agentOrchestrator.triggerAgent(agentId, conversationId, prompt).catch(err => {
+    // Create a mock message for the trigger
+    const mockMessage = {
+      id: `trigger-${Date.now()}`,
+      conversationId,
+      senderId: 'system',
+      content: prompt,
+      type: 'text',
+      timestamp: new Date().toISOString()
+    };
+    
+    agentOrchestrator.processMessage(mockMessage, conversationId).catch(err => {
       console.error('Error triggering agent:', err);
     });
     

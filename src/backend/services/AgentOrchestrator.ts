@@ -35,6 +35,9 @@ export class AgentOrchestrator {
   private agents: Map<string, Agent> = new Map();
   private tools: Map<string, Tool> = new Map();
   private activeProcessing: Set<string> = new Set();
+  private conversationCycles: Map<string, number> = new Map(); // Track communication cycles per conversation
+  private maxCollaborationCycles = 3; // Maximum rounds of agent collaboration
+  private recentResponders: Map<string, Set<string>> = new Map(); // Track which agents recently responded per conversation
   private prisma: PrismaClient;
 
   constructor(
@@ -55,6 +58,9 @@ export class AgentOrchestrator {
         where: { isActive: true },
       });
 
+      // Clear existing agents from memory
+      this.agents.clear();
+
       agents.forEach(agent => {
         this.agents.set(agent.id, {
           id: agent.id,
@@ -68,7 +74,7 @@ export class AgentOrchestrator {
         });
       });
 
-      console.log(`✅ Loaded ${agents.length} agents`);
+      console.log(`✅ Loaded ${agents.length} agents into memory:`, agents.map(a => `${a.name} (${a.role})`));
     } catch (error) {
       console.error('Error loading agents:', error);
     }
@@ -85,8 +91,8 @@ export class AgentOrchestrator {
         data: {
           id,
           name: agentData.name,
-          avatar: agentData.avatar,
-          description: agentData.description,
+          avatar: agentData.avatar || null,
+          description: agentData.description || null,
           role: agentData.role,
           config: JSON.stringify(agentData.config),
           capabilities: JSON.stringify(defaultCapabilities),
@@ -96,11 +102,20 @@ export class AgentOrchestrator {
 
       const newAgent: Agent = {
         id,
-        ...agentData,
+        name: agentData.name,
+        avatar: agentData.avatar,
+        description: agentData.description,
+        role: agentData.role,
+        config: agentData.config,
+        capabilities: defaultCapabilities,
+        isActive: agentData.isActive ?? true,
       };
 
       this.agents.set(id, newAgent);
       this.io.emit('agent-created', newAgent);
+
+      console.log(`✅ Created and loaded agent: ${newAgent.name} (${newAgent.role}) with capabilities:`, defaultCapabilities);
+      console.log(`📊 Total agents in memory: ${this.agents.size}`);
 
       return newAgent;
     } catch (error) {
@@ -173,15 +188,66 @@ export class AgentOrchestrator {
       }
       this.activeProcessing.add(processingKey);
 
-      // Parse mentions and tasks from the message
+      // Reset collaboration cycle counter for new user messages
+      if (message.senderId === 'user') {
+        this.conversationCycles.set(conversationId, 0);
+        this.recentResponders.set(conversationId, new Set()); // Reset recent responders
+        console.log(`🔄 Starting new collaboration cycle for conversation ${conversationId}`);
+        
+        // Clear recent responders after 5 minutes to allow agents to respond again
+        setTimeout(() => {
+          this.recentResponders.delete(conversationId);
+          console.log(`⏰ Cleared recent responders for conversation ${conversationId} after timeout`);
+        }, 5 * 60 * 1000); // 5 minutes
+      }
+
+      // Check if we've reached max collaboration cycles
+      const currentCycle = this.conversationCycles.get(conversationId) || 0;
+      if (currentCycle >= this.maxCollaborationCycles) {
+        console.log(`⏹️ Max collaboration cycles (${this.maxCollaborationCycles}) reached for conversation ${conversationId}`);
+        this.activeProcessing.delete(processingKey);
+        return;
+      }
+
+      // Parse collaboration triggers from the message
+      const collaborationTriggers = this.extractCollaborationTriggers(message.content);
       const mentions = this.extractMentions(message.content);
       const tasks = this.extractTasks(message.content);
       
-      // Get conversation context
+      // Get conversation context and memory
       const conversationMemory = await this.memoryService.getConversationMemory(conversationId);
       const conversation = await this.conversationService.getConversation(conversationId);
+      const recentMessages = await this.conversationService.getRecentMessages(conversationId, 15);
       
-      // Process mentions - trigger specific agents
+      // Process collaboration triggers - these are natural ways agents can call each other
+      if (collaborationTriggers.length > 0) {
+        console.log(`🤝 Processing collaboration triggers: ${collaborationTriggers.join(', ')}`);
+        
+        // Only trigger ONE agent per collaboration cycle to prevent spam
+        let triggeredOneAgent = false;
+        
+        for (const trigger of collaborationTriggers) {
+          if (triggeredOneAgent) break; // Only trigger one agent per cycle
+          
+          const targetAgents = this.findAgentsByCollaborationTrigger(trigger, conversationMemory);
+          console.log(`🎯 Found ${targetAgents.length} agents for trigger "${trigger}":`, targetAgents.map(a => a.name));
+          
+          // Filter out agents that have recently responded
+          const recentRespondersSet = this.recentResponders.get(conversationId) || new Set();
+          const availableAgents = targetAgents.filter(agent => !recentRespondersSet.has(agent.id));
+          
+          console.log(`✅ Available agents (not recently responded):`, availableAgents.map(a => a.name));
+          
+          // Only trigger the first available agent
+          if (availableAgents.length > 0) {
+            await this.triggerAgentWithContext(availableAgents[0].id, conversationId, message, recentMessages, conversationMemory);
+            triggeredOneAgent = true;
+            break; // Exit after triggering one agent
+          }
+        }
+      }
+
+      // Process mentions - direct agent calls
       for (const mention of mentions) {
         const agentName = mention.substring(1); // Remove @ symbol
         const agent = Array.from(this.agents.values()).find(
@@ -189,39 +255,49 @@ export class AgentOrchestrator {
         );
         
         if (agent) {
-          await this.triggerAgent(agent.id, conversationId, message.content);
+          // Check if this agent has recently responded
+          const recentRespondersSet = this.recentResponders.get(conversationId) || new Set();
+          if (!recentRespondersSet.has(agent.id)) {
+            await this.triggerAgentWithContext(agent.id, conversationId, message, recentMessages, conversationMemory);
+          } else {
+            console.log(`⏭️ Skipping ${agent.name} - recently responded`);
+          }
         }
       }
 
-      // Process tasks - find capable agents
+      // Process tasks - capability-based triggers
       for (const task of tasks) {
         const taskName = task.substring(1); // Remove # symbol
         const capableAgents = this.findCapableAgents(taskName);
         
         if (capableAgents.length > 0) {
-          // Use the first capable agent for now
-          await this.triggerAgent(capableAgents[0].id, conversationId, `Task: ${taskName}\n${message.content}`);
+          // Find first agent that hasn't recently responded
+          const recentRespondersSet = this.recentResponders.get(conversationId) || new Set();
+          const availableAgent = capableAgents.find(agent => !recentRespondersSet.has(agent.id));
+          
+          if (availableAgent) {
+            await this.triggerAgentWithContext(availableAgent.id, conversationId, message, recentMessages, conversationMemory);
+          } else {
+            console.log(`⏭️ All capable agents have recently responded for task: ${taskName}`);
+          }
         }
       }
 
-      // If no specific mentions or tasks, trigger all active agents in the conversation
-      if (mentions.length === 0 && tasks.length === 0) {
-        // Get all participants in the conversation
-        const conversation = await this.conversationService.getConversation(conversationId);
-        const participantIds = conversation.participants;
+      // If no specific triggers, start initial collaboration for user messages
+      if (message.senderId === 'user' && collaborationTriggers.length === 0 && mentions.length === 0 && tasks.length === 0) {
+        console.log(`🚀 Starting initial collaboration for user message`);
         
-        console.log(`🔍 Processing message in conversation ${conversationId}`);
-        console.log(`👥 Participants: ${participantIds.join(', ')}`);
+        // For user messages, always start with coordinator if available
+        const coordinator = Array.from(this.agents.values()).find(agent => 
+          agent.role.toLowerCase().includes('coordinator') && agent.isActive
+        );
         
-        // Trigger all active agents that are participants (except the user)
-        for (const agentId of participantIds) {
-          const agent = this.agents.get(agentId);
-          if (agent && agent.isActive && agent.role !== 'user' && agent.role !== 'system') {
-            console.log(`🤖 Triggering agent: ${agent.name} (${agent.role})`);
-            await this.triggerAgent(agent.id, conversationId, message.content);
-          } else {
-            console.log(`⏭️ Skipping agent ${agentId}: ${agent ? `${agent.name} (${agent.role})` : 'not found'}`);
-          }
+        if (coordinator) {
+          console.log(`🎯 Starting collaboration with coordinator: ${coordinator.name}`);
+          await this.triggerAgentWithContext(coordinator.id, conversationId, message, recentMessages, conversationMemory);
+        } else {
+          // Fallback to general collaboration
+          await this.startInitialCollaboration(conversationId, message, recentMessages, conversationMemory);
         }
       }
 
@@ -232,29 +308,34 @@ export class AgentOrchestrator {
     }
   }
 
-  async triggerAgent(agentId: string, conversationId: string, prompt?: string) {
+  async triggerAgentWithContext(agentId: string, conversationId: string, message: any, recentMessages: any[], conversationMemory: any) {
     try {
-      console.log(`🚀 Starting to trigger agent: ${agentId}`);
+      console.log(`🚀 Triggering agent: ${agentId} with enhanced context`);
       const agent = this.agents.get(agentId);
       if (!agent || !agent.isActive) {
         console.warn(`Agent ${agentId} not found or inactive`);
         return;
       }
       
-      console.log(`✅ Agent ${agent.name} is active, proceeding with response generation`);
+      // Increment collaboration cycle
+      const currentCycle = this.conversationCycles.get(conversationId) || 0;
+      this.conversationCycles.set(conversationId, currentCycle + 1);
+      console.log(`🔄 Collaboration cycle ${currentCycle + 1}/${this.maxCollaborationCycles} for conversation ${conversationId}`);
+      
+      // Track this agent as recently responded
+      const recentRespondersSet = this.recentResponders.get(conversationId) || new Set();
+      recentRespondersSet.add(agentId);
+      this.recentResponders.set(conversationId, recentRespondersSet);
+      console.log(`📝 Marked ${agent.name} as recently responded`);
 
       // Show typing indicator
       this.conversationService.broadcastTypingIndicator(conversationId, agentId, true);
 
-      // Get context
-      const conversationMemory = await this.memoryService.getConversationMemory(conversationId);
-      const recentMessages = await this.conversationService.getRecentMessages(conversationId, 10);
+      // Build enhanced context with collaboration awareness
+      const context = this.buildCollaborativeContext(agent, conversationMemory, recentMessages, message);
       
-      // Build context for the agent
-      const context = this.buildAgentContext(agent, conversationMemory, recentMessages);
-      
-      // Generate agent response
-      const fullPrompt = this.buildPrompt(agent, context, prompt || 'Please respond based on the conversation context.');
+      // Generate agent response with collaboration prompts
+      const fullPrompt = this.buildCollaborativePrompt(agent, context, message, currentCycle + 1);
       
       // Stream the response
       let responseContent = '';
@@ -275,7 +356,7 @@ export class AgentOrchestrator {
       this.conversationService.broadcastTypingIndicator(conversationId, agentId, false);
 
       // Save the agent's response as a message
-      await this.conversationService.createMessage({
+      const agentMessage = await this.conversationService.createMessage({
         conversationId,
         senderId: agentId,
         content: responseContent,
@@ -283,11 +364,29 @@ export class AgentOrchestrator {
         metadata: {
           model: agent.config.model,
           provider: agent.config.llmProvider,
+          collaborationCycle: currentCycle + 1,
         },
       });
 
-      // Update conversation memory with key points
+      // Update conversation memory with key points and collaboration context
       await this.updateConversationMemory(conversationId, agentId, responseContent);
+
+      // Check for collaboration triggers in the agent's response
+      const responseTriggers = this.extractCollaborationTriggers(responseContent);
+      if (responseTriggers.length > 0) {
+        console.log(`🤝 Agent ${agent.name} triggered collaboration: ${responseTriggers.join(', ')}`);
+        
+        // Only continue if we haven't reached max cycles
+        const currentCycle = this.conversationCycles.get(conversationId) || 0;
+        if (currentCycle < this.maxCollaborationCycles) {
+          // Process the agent's response as a new message to trigger collaboration
+          await this.processMessage(agentMessage, conversationId);
+        } else {
+          console.log(`🛑 Max collaboration cycles (${this.maxCollaborationCycles}) reached, stopping`);
+        }
+      } else {
+        console.log(`✅ Agent ${agent.name} completed contribution without triggering further collaboration`);
+      }
 
     } catch (error) {
       console.error(`Error triggering agent ${agentId}:`, error);
@@ -301,6 +400,36 @@ export class AgentOrchestrator {
         type: 'system',
         metadata: { error: error.message },
       });
+    }
+  }
+
+  async startInitialCollaboration(conversationId: string, userMessage: any, recentMessages: any[], conversationMemory: any) {
+    try {
+      console.log(`🎯 Starting initial collaboration sequence`);
+      
+      // Get conversation participants
+      const conversation = await this.conversationService.getConversation(conversationId);
+      const participantIds = conversation.participants;
+      
+      // Find the most appropriate agent to start (usually coordinator or project manager)
+      const starterAgent = this.findStarterAgent(participantIds, userMessage.content);
+      
+      if (starterAgent) {
+        console.log(`🎬 Starting collaboration with ${starterAgent.name}`);
+        await this.triggerAgentWithContext(starterAgent.id, conversationId, userMessage, recentMessages, conversationMemory);
+      } else {
+        // Fallback: trigger all agents in sequence
+        console.log(`🔄 No starter agent found, triggering all participants`);
+        for (const agentId of participantIds) {
+          const agent = this.agents.get(agentId);
+          if (agent && agent.isActive && agent.role !== 'user' && agent.role !== 'system') {
+            await this.triggerAgentWithContext(agent.id, conversationId, userMessage, recentMessages, conversationMemory);
+            break; // Only trigger the first one, let collaboration flow naturally
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error starting initial collaboration:', error);
     }
   }
 
@@ -341,6 +470,205 @@ export class AgentOrchestrator {
     };
   }
 
+  // Collaboration Trigger Methods
+  private extractCollaborationTriggers(content: string): string[] {
+    const collaborationPatterns = [
+      /(?:need|want|require|looking for|seeking)\s+(?:a|an|the)\s+(\w+)/gi,
+      /(?:can you|please|would you)\s+(?:help|assist|support)\s+(?:with|on)\s+(\w+)/gi,
+      /(?:let's|we should|we need to)\s+(\w+)/gi,
+      /(?:design|frontend|backend|database|api|ui|ux|testing|deployment)/gi,
+      /(?:collaborate|work together|team up|coordinate)/gi
+    ];
+
+    const triggers: string[] = [];
+    
+    collaborationPatterns.forEach(pattern => {
+      const matches = content.match(pattern) || [];
+      matches.forEach(match => {
+        const trigger = match.toLowerCase().trim();
+        if (!triggers.includes(trigger)) {
+          triggers.push(trigger);
+        }
+      });
+    });
+
+    return triggers;
+  }
+
+  private findAgentsByCollaborationTrigger(trigger: string, conversationMemory: any): Agent[] {
+    const triggerLower = trigger.toLowerCase();
+    const relevantAgents: Agent[] = [];
+
+    console.log(`🔍 Searching for agents with trigger "${trigger}" (${triggerLower})`);
+    console.log(`📋 Available agents in memory:`, Array.from(this.agents.values()).map(a => `${a.name} (${a.role})`));
+
+    // Map triggers to agent roles/capabilities
+    const triggerMappings: { [key: string]: string[] } = {
+      'design': ['designer', 'ui/ux designer', 'creative director'],
+      'frontend': ['frontend developer', 'react developer', 'ui developer'],
+      'backend': ['backend developer', 'api developer', 'server developer'],
+      'database': ['database developer', 'data engineer', 'backend developer'],
+      'api': ['backend developer', 'api developer', 'full-stack developer'],
+      'ui': ['ui/ux designer', 'frontend developer', 'designer'],
+      'ux': ['ui/ux designer', 'designer', 'user experience designer'],
+      'testing': ['qa engineer', 'test engineer', 'quality assurance'],
+      'deployment': ['devops engineer', 'backend developer', 'system administrator'],
+      'need': ['project manager', 'coordinator', 'team lead'],
+      'want': ['project manager', 'coordinator', 'team lead'],
+      'require': ['project manager', 'coordinator', 'team lead'],
+      'help': ['project manager', 'coordinator', 'team lead'],
+      'assist': ['project manager', 'coordinator', 'team lead'],
+      'support': ['project manager', 'coordinator', 'team lead'],
+      'collaborate': ['project manager', 'coordinator', 'team lead'],
+      'work together': ['project manager', 'coordinator', 'team lead'],
+      'team up': ['project manager', 'coordinator', 'team lead'],
+      'coordinate': ['project manager', 'coordinator', 'team lead']
+    };
+
+    // Find agents based on trigger mappings
+    for (const [key, roles] of Object.entries(triggerMappings)) {
+      if (triggerLower.includes(key)) {
+        console.log(`🎯 Trigger "${trigger}" matches key "${key}"`);
+        for (const role of roles) {
+          console.log(`🔍 Looking for role: "${role}"`);
+          const agents = Array.from(this.agents.values()).filter(agent => {
+            if (!agent || !agent.isActive) {
+              console.log(`❌ Agent ${agent?.name} filtered out: not active or null`);
+              return false;
+            }
+            
+            const roleMatch = agent.role.toLowerCase().includes(role.toLowerCase());
+            const capabilityMatch = agent.capabilities && Array.isArray(agent.capabilities) && 
+              agent.capabilities.some(cap => cap.toLowerCase().includes(role.toLowerCase()));
+            
+            console.log(`🔍 Agent ${agent.name} (${agent.role}): roleMatch=${roleMatch}, capabilityMatch=${capabilityMatch}`);
+            
+            return roleMatch || capabilityMatch;
+          });
+          console.log(`✅ Found ${agents.length} agents for role "${role}":`, agents.map(a => a.name));
+          relevantAgents.push(...agents);
+        }
+      }
+    }
+
+    // Remove duplicates
+    return relevantAgents.filter((agent, index, self) => 
+      index === self.findIndex(a => a.id === agent.id)
+    );
+  }
+
+  private findStarterAgent(participantIds: string[], userMessage: string): Agent | null {
+    // Priority order for starter agents
+    const starterRoles = ['project manager', 'coordinator', 'team lead', 'product manager'];
+    
+    // First, try to find a starter agent among participants
+    for (const role of starterRoles) {
+      const agent = Array.from(this.agents.values()).find(a => 
+        participantIds.includes(a.id) && 
+        a.role.toLowerCase().includes(role.toLowerCase())
+      );
+      if (agent) return agent;
+    }
+
+    // If no starter agent, find the most relevant agent based on message content
+    const messageLower = userMessage.toLowerCase();
+    const relevantAgents = Array.from(this.agents.values()).filter(a => 
+      participantIds.includes(a.id) && 
+      a.role !== 'user' && 
+      a.role !== 'system'
+    );
+
+    // Score agents based on message relevance
+    const scoredAgents = relevantAgents.map(agent => {
+      let score = 0;
+      const roleLower = agent.role.toLowerCase();
+      const capabilities = agent.capabilities && Array.isArray(agent.capabilities) ? agent.capabilities.map(c => c.toLowerCase()) : [];
+
+      if (messageLower.includes('design') && (roleLower.includes('design') || capabilities.some(c => c.includes('design')))) score += 3;
+      if (messageLower.includes('frontend') && (roleLower.includes('frontend') || capabilities.some(c => c.includes('frontend')))) score += 3;
+      if (messageLower.includes('backend') && (roleLower.includes('backend') || capabilities.some(c => c.includes('backend')))) score += 3;
+      if (messageLower.includes('website') && (roleLower.includes('design') || roleLower.includes('frontend'))) score += 2;
+      if (messageLower.includes('app') && (roleLower.includes('frontend') || roleLower.includes('backend'))) score += 2;
+      if (messageLower.includes('api') && (roleLower.includes('backend') || capabilities.some(c => c.includes('api')))) score += 2;
+
+      return { agent, score };
+    });
+
+    // Return the highest scoring agent
+    scoredAgents.sort((a, b) => b.score - a.score);
+    return scoredAgents[0]?.agent || null;
+  }
+
+  // Enhanced Context Building
+  private buildCollaborativeContext(agent: Agent, memory: any, recentMessages: any[], message: any): string {
+    let context = `## Agent Role\n${agent.role}\n\n`;
+    
+    if (agent.description) {
+      context += `## Description\n${agent.description}\n\n`;
+    }
+    
+    context += `## Capabilities\n${agent.capabilities.join(', ')}\n\n`;
+    
+    context += `## Collaboration Context\n`;
+    context += `You are part of a collaborative team. Other team members may have already contributed to this conversation.\n`;
+    context += `Consider their input and build upon it when appropriate.\n\n`;
+    
+    context += `## Conversation Memory\n`;
+    context += `Summary: ${memory.conversation?.summary || 'No summary available'}\n`;
+    context += `Key Points: ${(memory.conversation?.keyPoints || []).join(', ')}\n`;
+    context += `Participants: ${Object.keys(memory.participants || {}).join(', ')}\n\n`;
+    
+    context += `## Recent Conversation Flow\n`;
+    recentMessages.forEach(msg => {
+      const senderName = msg.sender?.name || msg.senderId;
+      const isCurrentAgent = msg.senderId === agent.id;
+      const prefix = isCurrentAgent ? '🤖 [YOU]' : `👤 [${senderName}]`;
+      context += `${prefix}: ${msg.content}\n`;
+    });
+    
+    // Add discussion tracking to help avoid repetition
+    context += `\n## Discussion Tracking\n`;
+    const discussedTopics = this.extractDiscussedTopics(recentMessages);
+    if (discussedTopics.length > 0) {
+      context += `Already discussed: ${discussedTopics.join(', ')}\n`;
+      context += `Avoid repeating these topics. Focus on new insights or next steps.\n\n`;
+    }
+    
+    return context;
+  }
+
+  private buildCollaborativePrompt(agent: Agent, context: string, message: any, cycleNumber: number): string {
+    const collaborationGuidance = `
+## Collaboration Guidelines (Cycle ${cycleNumber}/3)
+
+You are ${agent.name}, a ${agent.role}. You're collaborating with other team members on this project.
+
+**How to collaborate naturally:**
+1. **Build on others' ideas** - Reference what others have said and expand on it
+2. **Ask for input** - If you need input from specific team members, mention them naturally
+3. **Suggest next steps** - Propose what should happen next in the workflow
+4. **Acknowledge contributions** - Recognize good ideas from other team members
+5. **Stay in character** - Respond as your role would naturally
+6. **Avoid repetition** - Don't ask questions that have already been asked by others
+7. **Provide concrete value** - Give specific insights, suggestions, or deliverables
+
+**Collaboration triggers you can use:**
+- "I need input from @[agent-name] on..."
+- "Let's work together on..."
+- "We should coordinate with..."
+- "This would work well with..."
+
+**Cycle ${cycleNumber} Focus:**
+${cycleNumber === 1 ? '- Initial analysis and requirements gathering' : ''}
+${cycleNumber === 2 ? '- Detailed planning and technical specifications' : ''}
+${cycleNumber === 3 ? '- Final coordination and next steps' : ''}
+
+**Remember:** This is cycle ${cycleNumber} of 3. Make your contribution meaningful and avoid repeating what others have already said.
+`;
+
+    return `${agent.config.systemPrompt}\n\n${context}\n\n${collaborationGuidance}\n\nCurrent Message: ${message.content}`;
+  }
+
   // Helper Methods
   private extractMentions(content: string): string[] {
     const mentionPattern = /@(\w+)/g;
@@ -354,8 +682,32 @@ export class AgentOrchestrator {
     return matches;
   }
 
+  private extractDiscussedTopics(messages: any[]): string[] {
+    const topics = new Set<string>();
+    
+    // Common topics to track
+    const topicKeywords = [
+      'css framework', 'charting library', 'responsive design', 'mobile-first',
+      'social login', 'authentication', 'api', 'database', 'wireframes',
+      'typography', 'color scheme', 'branding', 'accessibility', 'aria',
+      'kpis', 'metrics', 'analytics', 'dashboard', 'settings', 'profile'
+    ];
+    
+    messages.forEach(msg => {
+      const content = msg.content.toLowerCase();
+      topicKeywords.forEach(keyword => {
+        if (content.includes(keyword)) {
+          topics.add(keyword);
+        }
+      });
+    });
+    
+    return Array.from(topics);
+  }
+
   private findCapableAgents(task: string): Agent[] {
     return Array.from(this.agents.values()).filter(agent => 
+      agent && agent.isActive && agent.capabilities && Array.isArray(agent.capabilities) &&
       agent.capabilities.some(cap => 
         cap.toLowerCase().includes(task.toLowerCase()) ||
         task.toLowerCase().includes(cap.toLowerCase())
@@ -373,7 +725,8 @@ export class AgentOrchestrator {
       
       // Check if content matches agent's role or capabilities
       if (contentLower.includes(agent.role.toLowerCase()) ||
-          agent.capabilities.some(cap => contentLower.includes(cap.toLowerCase()))) {
+          (agent.capabilities && Array.isArray(agent.capabilities) && 
+           agent.capabilities.some(cap => contentLower.includes(cap.toLowerCase())))) {
         relevant.push(agent);
       }
     }
@@ -491,6 +844,47 @@ export class AgentOrchestrator {
 
   private getDefaultCapabilitiesForRole(role: string): string[] {
     switch (role.toLowerCase()) {
+      case 'coordinator':
+        return [
+          'project_management',
+          'task_coordination',
+          'team_collaboration',
+          'workflow_management',
+          'communication_facilitation'
+        ];
+      case 'designer':
+      case 'ui/ux designer':
+        return [
+          'ui_design',
+          'ux_design',
+          'wireframing',
+          'prototyping',
+          'design_systems',
+          'user_research',
+          'accessibility_design'
+        ];
+      case 'frontend-developer':
+      case 'frontend':
+        return [
+          'frontend_development',
+          'react_development',
+          'typescript',
+          'css_styling',
+          'responsive_design',
+          'component_architecture',
+          'api_integration'
+        ];
+      case 'backend-developer':
+      case 'backend':
+        return [
+          'backend_development',
+          'api_design',
+          'database_design',
+          'server_architecture',
+          'authentication',
+          'security',
+          'performance_optimization'
+        ];
       case 'researcher':
         return [
           'web_search',

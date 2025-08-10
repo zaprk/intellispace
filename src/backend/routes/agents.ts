@@ -85,7 +85,17 @@ export default function agentRoutes(prisma: PrismaClient, orchestrator: AgentOrc
   router.post('/:id/trigger', async (req, res) => {
     try {
       const { conversationId, prompt } = req.body;
-      await orchestrator.triggerAgent(req.params.id, conversationId, prompt);
+      // Create a mock message for the trigger
+      const mockMessage = {
+        id: `trigger-${Date.now()}`,
+        conversationId,
+        senderId: 'system',
+        content: prompt,
+        type: 'text',
+        timestamp: new Date().toISOString()
+      };
+      
+      await orchestrator.processMessage(mockMessage, conversationId);
       res.json({ success: true });
     } catch (error) {
       console.error('Error triggering agent:', error);
