@@ -4,6 +4,7 @@ import { MemoryService } from './MemoryService';
 import { ConversationService } from './ConversationService';
 import { PrismaClient } from '@prisma/client';
 import { v4 as uuidv4 } from 'uuid';
+import { WebTeamOrchestrator } from './WebTeamOrchestrator';
 
 export interface AgentConfig {
   llmProvider: 'openai' | 'anthropic' | 'ollama';
@@ -39,6 +40,7 @@ export class AgentOrchestrator {
   private maxCollaborationCycles = 3; // Maximum rounds of agent collaboration
   private recentResponders: Map<string, Set<string>> = new Map(); // Track which agents recently responded per conversation
   private prisma: PrismaClient;
+  private webTeamOrchestrator: WebTeamOrchestrator;
 
   constructor(
     private llmService: LLMService,
@@ -47,6 +49,12 @@ export class AgentOrchestrator {
     private io: SocketIOServer
   ) {
     this.prisma = new PrismaClient();
+    this.webTeamOrchestrator = new WebTeamOrchestrator(
+      this.llmService,
+      this.conversationService,
+      this.memoryService,
+      this.io
+    );
     this.initializeBuiltInTools();
     this.loadAgents();
   }
@@ -61,20 +69,29 @@ export class AgentOrchestrator {
       // Clear existing agents from memory
       this.agents.clear();
 
+      // Use a Map to deduplicate agents by ID
+      const uniqueAgents = new Map();
       agents.forEach(agent => {
-        this.agents.set(agent.id, {
-          id: agent.id,
-          name: agent.name,
-          avatar: agent.avatar || undefined,
-          description: agent.description || undefined,
-          role: agent.role,
-          config: JSON.parse(agent.config),
-          capabilities: JSON.parse(agent.capabilities),
-          isActive: agent.isActive,
-        });
+        if (!uniqueAgents.has(agent.id)) {
+          uniqueAgents.set(agent.id, {
+            id: agent.id,
+            name: agent.name,
+            avatar: agent.avatar || undefined,
+            description: agent.description || undefined,
+            role: agent.role,
+            config: JSON.parse(agent.config),
+            capabilities: JSON.parse(agent.capabilities),
+            isActive: agent.isActive,
+          });
+        }
       });
 
-      console.log(`✅ Loaded ${agents.length} agents into memory:`, agents.map(a => `${a.name} (${a.role})`));
+      // Load unique agents into memory
+      uniqueAgents.forEach((agent, id) => {
+        this.agents.set(id, agent);
+      });
+
+      console.log(`✅ Loaded ${uniqueAgents.size} unique agents into memory:`, Array.from(uniqueAgents.values()).map(a => `${a.name} (${a.role})`));
     } catch (error) {
       console.error('Error loading agents:', error);
     }
@@ -218,6 +235,32 @@ export class AgentOrchestrator {
       const conversationMemory = await this.memoryService.getConversationMemory(conversationId);
       const conversation = await this.conversationService.getConversation(conversationId);
       const recentMessages = await this.conversationService.getRecentMessages(conversationId, 15);
+
+      // Check if this is a website team conversation
+      const isWebsiteTeam = this.isWebsiteTeamConversation(conversationId);
+      
+      console.log(`🔍 DEBUG: message.senderId=${message.senderId}, isWebsiteTeam=${isWebsiteTeam}`);
+      console.log(`🔍 DEBUG: Available agents:`, Array.from(this.agents.values()).map(a => `${a.name} (${a.role})`));
+      
+      // Check if this is a user message (either 'user', 'user-agent', or a UUID that's not an agent ID)
+      const isUserMessage = message.senderId === 'user' || 
+                           message.senderId === 'user-agent' ||
+                           (message.senderId && !Array.from(this.agents.keys()).includes(message.senderId));
+      
+      console.log(`🔍 DEBUG: isUserMessage=${isUserMessage}, message.senderId=${message.senderId}, agentIds=${Array.from(this.agents.keys())}`);
+      
+      // Only trigger structured workflow for the FIRST user message in a conversation
+      const isFirstUserMessage = isUserMessage && recentMessages.length <= 1;
+      
+      if (isWebsiteTeam && isFirstUserMessage) {
+        console.log(`🏗️ Using structured workflow for website team conversation`);
+        this.webTeamOrchestrator.setAgents(this.agents); // Pass current agents to the orchestrator
+        await this.webTeamOrchestrator.processUserRequest(message, conversationId);
+        this.activeProcessing.delete(processingKey);
+        return; // Stop further processing in AgentOrchestrator
+      } else if (isUserMessage) {
+        console.log(`🔄 Using chaotic collaboration mode (not website team) - not first message`);
+      }
       
       // Process collaboration triggers - these are natural ways agents can call each other
       if (collaborationTriggers.length > 0) {
@@ -925,5 +968,18 @@ ${cycleNumber === 3 ? '- Final coordination and next steps' : ''}
           'problem_solving'
         ];
     }
+  }
+
+  private isWebsiteTeamConversation(conversationId: string): boolean {
+    // Check if this conversation has website team agents
+    const websiteTeamRoles = ['coordinator', 'designer', 'frontend-developer', 'backend-developer'];
+    const hasWebsiteTeam = Array.from(this.agents.values()).some(agent => 
+      websiteTeamRoles.includes(agent.role.toLowerCase())
+    );
+    
+    console.log(`🔍 Website team detection: hasWebsiteTeam=${hasWebsiteTeam}, agents=${Array.from(this.agents.values()).map(a => a.role)}`);
+    
+    // If we have website team agents, use structured workflow
+    return hasWebsiteTeam;
   }
 }
