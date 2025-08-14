@@ -8,63 +8,56 @@ datasource db {
 }
 
 model Project {
-  id          String   @id @default(uuid())
-  name        String
-  description String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
+  id            String         @id @default(uuid())
+  name          String
+  description   String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
   conversations Conversation[]
 }
 
 model Agent {
-  id           String   @id @default(uuid())
-  name         String   
+  id           String    @id @default(uuid())
+  name         String
   avatar       String?
   description  String?
   role         String
-  config       String   // JSON
-  capabilities String   // JSON array
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
-  messages Message[]
+  config       String
+  capabilities String
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  messages     Message[]
 }
 
 model Conversation {
-  id           String   @id @default(uuid())
+  id           String    @id @default(uuid())
   projectId    String
   name         String
-  type         String   // 'direct' or 'group'
-  participants String   // JSON array of agent IDs
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
-  project  Project   @relation(fields: [projectId], references: [id])
-  messages Message[]
+  type         String
+  participants String
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  project      Project   @relation(fields: [projectId], references: [id])
+  messages     Message[]
 }
 
 model Message {
-  id             String   @id @default(uuid())
+  id             String       @id @default(uuid())
   conversationId String
   senderId       String
   content        String
-  type           String   // 'text', 'system', 'tool_call', 'tool_response'
-  metadata       String?  // JSON
-  timestamp      DateTime @default(now())
-
-  conversation Conversation @relation(fields: [conversationId], references: [id])
-  sender       Agent        @relation(fields: [senderId], references: [id])
+  type           String
+  metadata       String?
+  timestamp      DateTime     @default(now())
+  sender         Agent        @relation(fields: [senderId], references: [id])
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
 }
 
 model Memory {
   id           String   @id @default(uuid())
-  scope        String   // 'project' or 'conversation'
-  scopeId      String   // project_id or conversation_id
-  data         String   // JSON
+  scope        String
+  scopeId      String
+  data         String
   lastModified DateTime @default(now())
-
-  // Remove the conflicting relations for now
-  // We'll handle the relationships in the application logic
 }

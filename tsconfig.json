@@ -25,6 +25,9 @@
         "@/utils/*": ["src/renderer/utils/*"]
       }
     },
+    "ts-node": {
+      "esm": true
+    },
     "include": ["src/renderer/**/*", "src/shared/**/*"],
     "exclude": ["node_modules", "dist"]
   }

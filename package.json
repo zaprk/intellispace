@@ -2,6 +2,7 @@
   "name": "intellispace-mvp",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:vite\" \"wait-on http://localhost:3000 && npm run dev:electron\"",
     "dev:vite": "vite",
@@ -41,6 +42,9 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.59.0",
+    "@langchain/core": "^0.3.69",
+    "@langchain/langgraph": "^0.4.4",
+    "@langchain/ollama": "^0.2.3",
     "@prisma/client": "^6.13.0",
     "axios": "^1.11.0",
     "cors": "^2.8.5",

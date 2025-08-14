@@ -14,6 +14,8 @@ import { ConversationService } from './services/ConversationService';
 import { AgentOrchestrator } from './services/AgentOrchestrator';
 import { LLMService } from './services/LLMService';
 import { MemoryService } from './services/MemoryService';
+import { WorkflowOrchestrator } from './services/WorkflowOrchestrator';
+import { Message } from '../shared/types';
 
 const app = express();
 const server = createServer(app);
@@ -33,10 +35,27 @@ const memoryService = new MemoryService(prisma);
 const conversationService = new ConversationService(prisma, io);
 const agentOrchestrator = new AgentOrchestrator(
   llmService,
-  memoryService,
   conversationService,
+  memoryService,
   io
 );
+// Initialize workflow orchestrator
+const workflowOrchestrator = new WorkflowOrchestrator(prisma);
+
+// Update workflow with actual agent IDs after agents are loaded
+const updateWorkflowAgents = () => {
+  workflowOrchestrator.updateTeamAgents(agentOrchestrator);
+};
+
+// Update workflow agents initially
+updateWorkflowAgents();
+
+// Update workflow agents whenever agents are reloaded
+const originalLoadAgents = agentOrchestrator.loadAgents.bind(agentOrchestrator);
+agentOrchestrator.loadAgents = async () => {
+  await originalLoadAgents();
+  updateWorkflowAgents();
+};
 
 // Middleware
 app.use(cors({
@@ -167,15 +186,74 @@ app.post('/api/messages', async (req, res) => {
   try {
     const message = await conversationService.createMessage(req.body);
     
-    // Process the message through agent orchestrator if not from system
-    if (req.body.senderId !== 'system' && req.body.senderId !== 'user') {
-      // Don't await this - let it process in background
-      agentOrchestrator.processMessage(message, req.body.conversationId).catch(err => {
-        console.error('Error processing message through orchestrator:', err);
-      });
+          // Process the message through LangGraph workflow if it's a user message
+      if (req.body.senderId === 'user' || req.body.senderId === 'user-agent') {
+        console.log('🔄 Processing user message through LangGraph workflow:', req.body.content);
+        console.log('🔍 [DEBUG] Message details:', {
+          senderId: req.body.senderId,
+          content: req.body.content,
+          conversationId: req.body.conversationId
+        });
+        
+        try {
+          console.log('🚀 [WORKFLOW] Starting workflow processing...');
+          const workflowResult = await workflowOrchestrator.processMessage(message as unknown as Message);
+          
+          console.log('✅ [WORKFLOW] Workflow processing completed successfully');
+          console.log('📊 [WORKFLOW] Workflow state:', {
+            phase: workflowResult.phase,
+            taggedAgents: workflowResult.taggedAgents,
+            agentOutputs: Object.keys(workflowResult.agentOutputs),
+            error: workflowResult.error
+          });
+          
+          // Save the workflow state
+          workflowOrchestrator.saveWorkflowState(workflowResult);
+          
+          // Create response messages for each agent output
+          const responseMessages: any[] = [];
+          
+          for (const [agentId, output] of Object.entries(workflowResult.agentOutputs)) {
+            if (output.message) {
+              console.log(`📤 [WORKFLOW] Creating response for agent: ${agentId}`);
+              const responseMessage = await conversationService.createMessage({
+                content: output.message,
+                conversationId: req.body.conversationId,
+                senderId: agentId,
+                type: 'text' as const,
+                metadata: {
+                  workflowPhase: workflowResult.phase,
+                  agentOutput: output,
+                  workflowStep: workflowResult.workflowHistory.find(h => h.node === agentId)
+                }
+              });
+              
+              responseMessages.push(responseMessage);
+            }
+          }
+          
+          console.log('✅ [WORKFLOW] All workflow responses created');
+          
+          // Return both the original message and workflow responses
+          res.json({
+            message,
+            workflowResponses: responseMessages,
+            workflowState: workflowResult
+          });
+        } catch (workflowError) {
+          console.error('❌ [WORKFLOW] Workflow processing error:', workflowError);
+          console.log('🔄 [FALLBACK] Falling back to AgentOrchestrator...');
+          
+          // Fallback to old agent orchestrator if workflow fails
+          agentOrchestrator.processMessage(message, req.body.conversationId).catch(err => {
+            console.error('❌ [FALLBACK] Error processing message with fallback:', err);
+          });
+          
+          res.json(message);
+        }
+    } else {
+      res.json(message);
     }
-    
-    res.json(message);
   } catch (error: any) {
     console.error('Error creating message:', error);
     res.status(500).json({ error: error.message });
@@ -221,6 +299,75 @@ app.post('/api/memory/:scope/:scopeId/search', async (req, res) => {
     res.json(results);
   } catch (error: any) {
     console.error('Error searching memory:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== Workflow Routes =====
+import workflowRoutes from './routes/workflow';
+
+app.use('/api/workflow', workflowRoutes);
+
+app.post('/api/workflow/process', async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+    
+    console.log('🔄 Processing message through LangGraph workflow:', message.content);
+    
+    const workflowResult = await workflowOrchestrator.processMessage(message as Message);
+    
+    // Save the workflow state
+    workflowOrchestrator.saveWorkflowState(workflowResult);
+    
+    // Create response messages for each agent output
+    const responseMessages: any[] = [];
+    
+    for (const [agentId, output] of Object.entries(workflowResult.agentOutputs)) {
+      if (output.message) {
+        const responseMessage = await conversationService.createMessage({
+          content: output.message,
+          conversationId: message.conversationId,
+          senderId: agentId,
+          type: 'text' as const,
+          metadata: {
+            workflowPhase: workflowResult.phase,
+            agentOutput: output,
+            workflowStep: workflowResult.workflowHistory.find(h => h.node === agentId)
+          }
+        });
+        
+        responseMessages.push(responseMessage);
+      }
+    }
+    
+    res.json({
+      workflowState: workflowResult,
+      responseMessages,
+      success: true
+    });
+    
+  } catch (error: any) {
+    console.error('Error processing workflow:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/workflow/state/:conversationId', async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const state = workflowOrchestrator.getWorkflowState(conversationId);
+    
+    if (!state) {
+      return res.status(404).json({ error: 'Workflow state not found' });
+    }
+    
+    res.json(state);
+  } catch (error: any) {
+    console.error('Error fetching workflow state:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -411,11 +558,61 @@ io.on('connection', (socket) => {
       // Create message through conversation service
       const message = await conversationService.createMessage(data);
       
-      // Process through agent orchestrator if it's a user message
-      if (data.senderId === 'user') {
-        agentOrchestrator.processMessage(message, data.conversationId).catch(err => {
-          console.error('Error processing message:', err);
+      // Process through LangGraph workflow if it's a user message
+      if (data.senderId === 'user' || data.senderId === 'user-agent') {
+        console.log('🔄 Processing user message through LangGraph workflow:', data.content);
+        console.log('🔍 [DEBUG] Socket message details:', {
+          senderId: data.senderId,
+          content: data.content,
+          conversationId: data.conversationId
         });
+        
+        try {
+          console.log('🚀 [WORKFLOW] Starting workflow processing...');
+          const workflowResult = await workflowOrchestrator.processMessage(message as unknown as Message);
+          
+          console.log('✅ [WORKFLOW] Workflow processing completed successfully');
+          console.log('📊 [WORKFLOW] Workflow state:', {
+            phase: workflowResult.phase,
+            taggedAgents: workflowResult.taggedAgents,
+            agentOutputs: Object.keys(workflowResult.agentOutputs),
+            error: workflowResult.error
+          });
+          
+          // Save the workflow state
+          workflowOrchestrator.saveWorkflowState(workflowResult);
+          
+          // Create response messages for each agent output
+          for (const [agentId, output] of Object.entries(workflowResult.agentOutputs)) {
+            if (output.message) {
+              console.log(`📤 [WORKFLOW] Creating response for agent: ${agentId}`);
+              const responseMessage = await conversationService.createMessage({
+                content: output.message,
+                conversationId: data.conversationId,
+                senderId: agentId,
+                type: 'text' as const,
+                metadata: {
+                  workflowPhase: workflowResult.phase,
+                  agentOutput: output,
+                  workflowStep: workflowResult.workflowHistory.find(h => h.node === agentId)
+                }
+              });
+              
+              // Broadcast the response message
+              io.to(`conversation:${data.conversationId}`).emit('new-message', responseMessage);
+            }
+          }
+          
+          console.log('✅ [WORKFLOW] All workflow responses created and broadcasted');
+        } catch (workflowError) {
+          console.error('❌ [WORKFLOW] Workflow processing error:', workflowError);
+          console.log('🔄 [FALLBACK] Falling back to AgentOrchestrator...');
+          
+          // Fallback to old agent orchestrator if workflow fails
+          agentOrchestrator.processMessage(message, data.conversationId).catch(err => {
+            console.error('❌ [FALLBACK] Error processing message with fallback:', err);
+          });
+        }
       }
     } catch (error) {
       console.error('WebSocket message error:', error);

@@ -1,9 +1,26 @@
 // Enhanced AgentOrchestrator for Web Development Team
-import { Agent } from './AgentOrchestrator';
 import { LLMService } from './LLMService';
 import { ConversationService } from './ConversationService';
 import { MemoryService } from './MemoryService';
 import { Server as SocketIOServer } from 'socket.io';
+
+// Agent interface definition
+interface Agent {
+  id: string;
+  name: string;
+  role: string;
+  description?: string;
+  avatar?: string;
+  config: {
+    llmProvider: string;
+    model: string;
+    temperature: number;
+    maxTokens: number;
+    systemPrompt: string;
+  };
+  capabilities: string[];
+  isActive: boolean;
+}
 
 interface TeamWorkflow {
   phase: 'requirements' | 'design' | 'frontend' | 'backend' | 'integration' | 'complete';
@@ -115,13 +132,14 @@ export class WebTeamOrchestrator {
     while (this.workflow.currentRound < this.workflow.maxRounds && 
            this.workflow.phase !== 'complete') {
       
-      const activeAgent = this.agents.get(this.workflow.activeAgent);
+      // Find agent by role instead of ID
+      const activeAgent = Array.from(this.agents.values()).find(agent => agent.role === this.workflow.activeAgent);
       if (!activeAgent) {
-        console.log(`❌ Agent ${this.workflow.activeAgent} not found, stopping workflow`);
+        console.log(`❌ Agent with role ${this.workflow.activeAgent} not found, stopping workflow`);
         break;
       }
 
-      console.log(`🔄 Round ${this.workflow.currentRound + 1}: ${activeAgent.name} working on ${this.workflow.phase} phase`);
+      console.log(`🔄 Round ${this.workflow.currentRound + 1}: ${activeAgent.name} (${activeAgent.role}) working on ${this.workflow.phase} phase`);
 
       // Execute current phase
       const response = await this.executePhase(activeAgent);
@@ -198,7 +216,7 @@ Respond as ${agent.name} (${agent.role}):`;
       fullPrompt,
       {
         model: agent.config.model,
-        provider: agent.config.llmProvider,
+        provider: agent.config.llmProvider as 'openai' | 'anthropic' | 'ollama',
         temperature: agent.config.temperature,
         maxTokens: agent.config.maxTokens,
       },
@@ -323,37 +341,45 @@ Respond as ${agent.name} (${agent.role}):`;
 
   private advanceWorkflow(): void {
     const currentPhase = this.workflow.phase;
-    const currentAgent = this.workflow.activeAgent;
+    const currentAgentRole = this.workflow.activeAgent;
     
-    // Define workflow transitions
+    // Find the current agent by role
+    const currentAgent = Array.from(this.agents.values()).find(agent => agent.role === currentAgentRole);
+    if (!currentAgent) {
+      console.log(`❌ Agent with role ${currentAgentRole} not found, stopping workflow`);
+      this.workflow.phase = 'complete';
+      return;
+    }
+    
+    // Define workflow transitions by role
     const transitions = {
       requirements: {
-        coordinator: { next: 'design', agent: 'designer' }
+        coordinator: { next: 'design', role: 'designer' }
       },
       design: {
-        designer: { next: 'frontend', agent: 'frontend-developer' },
-        coordinator: { next: 'frontend', agent: 'frontend-developer' }
+        designer: { next: 'frontend', role: 'frontend-developer' },
+        coordinator: { next: 'frontend', role: 'frontend-developer' }
       },
       frontend: {
-        'frontend-developer': { next: 'backend', agent: 'backend-developer' },
-        coordinator: { next: 'backend', agent: 'backend-developer' }
+        'frontend-developer': { next: 'backend', role: 'backend-developer' },
+        coordinator: { next: 'backend', role: 'backend-developer' }
       },
       backend: {
-        'backend-developer': { next: 'integration', agent: 'coordinator' },
-        coordinator: { next: 'integration', agent: 'frontend-developer' }
+        'backend-developer': { next: 'integration', role: 'coordinator' },
+        coordinator: { next: 'integration', role: 'frontend-developer' }
       },
       integration: {
-        coordinator: { next: 'complete', agent: 'coordinator' },
-        'frontend-developer': { next: 'complete', agent: 'coordinator' }
+        coordinator: { next: 'complete', role: 'coordinator' },
+        'frontend-developer': { next: 'complete', role: 'coordinator' }
       }
     };
 
-    const transition = transitions[currentPhase]?.[currentAgent];
+    const transition = transitions[currentPhase]?.[currentAgentRole];
     if (transition) {
       this.workflow.phase = transition.next;
-      this.workflow.activeAgent = transition.agent;
-      this.workflow.completedTasks.push(`${currentAgent}:${currentPhase}`);
-      console.log(`🔄 Transitioning from ${currentPhase} (${currentAgent}) to ${transition.next} (${transition.agent})`);
+      this.workflow.activeAgent = transition.role;
+      this.workflow.completedTasks.push(`${currentAgentRole}:${currentPhase}`);
+      console.log(`🔄 Transitioning from ${currentPhase} (${currentAgentRole}) to ${transition.next} (${transition.role})`);
     } else {
       // Fallback: move to next logical agent or complete
       this.workflow.phase = 'complete';
