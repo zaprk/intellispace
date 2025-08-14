@@ -1,4 +1,3 @@
-import { StateGraph, END } from "@langchain/langgraph";
 import { ChatOllama } from "@langchain/ollama";
 import { HumanMessage } from "@langchain/core/messages";
 import { 
@@ -11,888 +10,481 @@ import {
 } from "../../shared/types";
 import { PrismaClient } from "@prisma/client";
 
-export class WorkflowOrchestrator {
-  private graph: any; // Using any for now due to complex LangGraph types
-  private prisma: PrismaClient;
-  private llm: ChatOllama;
-  private config: WorkflowConfig;
-  private teamAgents: string[];
+// ===== NEW TYPES =====
+export interface SharedWorkflowState {
+  conversationId: string;
+  phase: 'analysis' | 'coordination' | 'collaboration' | 'integration' | 'complete';
+  
+  // Original user input
+  userRequest: string;
+  
+  // Shared knowledge base that accumulates
+  sharedKnowledge: {
+    projectRequirements: string;
+    designDecisions: string[];
+    technicalDecisions: string[];
+    implementationNotes: string[];
+    integrationPoints: string[];
+    completedTasks: string[];
+    blockers: string[];
+  };
+  
+  // Agent contributions to shared state
+  agentContributions: {
+    coordinator?: AgentContribution;
+    designer?: AgentContribution;
+    'frontend-developer'?: AgentContribution;
+    'backend-developer'?: AgentContribution;
+  };
+  
+  // Flow control
+  activeAgents: string[];
+  nextAgents: string[];
+  collaborationRound: number;
+  maxRounds: number;
+  
+  // Messages for UI
+  messages: Message[];
+  error?: string;
+}
 
-  constructor(prisma: PrismaClient, teamAgents: string[] = []) {
+export interface AgentContribution {
+  agentId: string;
+  round: number;
+  timestamp: string;
+  
+  // What this agent added to shared knowledge
+  knowledgeUpdates: {
+    requirements?: string[];
+    decisions?: string[];
+    tasks?: string[];
+    blockers?: string[];
+  };
+  
+  // Dependencies on other agents
+  dependsOn: string[];
+  enablesAgents: string[];
+  
+  // Status
+  status: 'pending' | 'contributing' | 'complete' | 'blocked';
+  
+  // Public message for UI
+  message: string;
+  
+  // Internal reasoning (not shown to user)
+  reasoning?: string;
+}
+
+// ===== FIXED WORKFLOW ORCHESTRATOR =====
+export class WorkflowOrchestrator {
+  private teamAgents: string[] = [];
+  private agentInfo: Agent[] = [];
+  private llm: ChatOllama;
+  private prisma: PrismaClient;
+  private io?: any; // Socket.IO instance for streaming
+  
+  constructor(prisma: PrismaClient) {
     this.prisma = prisma;
     this.llm = new ChatOllama({ model: "llama2" });
-    this.teamAgents = teamAgents.length > 0 ? teamAgents : ["coordinator", "designer", "frontend-developer", "backend-developer"];
-    this.config = this.createDefaultConfig();
-    this.graph = this.buildWorkflowGraph();
+  }
+  
+  setSocketIO(io: any) {
+    this.io = io;
+  }
+  
+  setAgents(agents: Agent[]) {
+    this.agentInfo = agents;
+    this.teamAgents = agents
+      .filter(agent => ['coordinator', 'designer', 'frontend-developer', 'backend-developer'].includes(agent.role))
+      .map(agent => agent.id);
+    
+    console.log('🔧 [WORKFLOW] Set agents:', this.teamAgents);
+    console.log('🔧 [WORKFLOW] Agent info:', agents.map(a => `${a.name} (${a.role})`));
   }
 
-  // Method to update team agents dynamically
+  private getAgentIdByRole(role: string): string | undefined {
+    const agent = this.agentInfo.find(a => a.role === role);
+    return agent?.id;
+  }
+  
+  async processMessage(message: Message): Promise<SharedWorkflowState> {
+    console.log('🚀 Starting shared state workflow...');
+    
+    // Initialize shared state
+    const state: SharedWorkflowState = {
+      conversationId: message.conversationId,
+      phase: 'analysis',
+      userRequest: message.content,
+      sharedKnowledge: {
+        projectRequirements: '',
+        designDecisions: [],
+        technicalDecisions: [],
+        implementationNotes: [],
+        integrationPoints: [],
+        completedTasks: [],
+        blockers: []
+      },
+      agentContributions: {},
+      activeAgents: [],
+      nextAgents: [this.getAgentIdByRole('coordinator')].filter((id): id is string => id !== undefined),
+      collaborationRound: 1,
+      maxRounds: 3,
+      messages: []
+    };
+    
+    // Run the collaborative workflow
+    while (state.phase !== 'complete' && state.collaborationRound <= state.maxRounds) {
+      console.log(`🔄 Round ${state.collaborationRound}, Phase: ${state.phase}`);
+      console.log(`🎯 Active agents: ${state.nextAgents.join(', ')}`);
+      
+      // Process next agents in sequence
+      await this.processAgentRound(state);
+      
+      // Update workflow state
+      this.updateWorkflowPhase(state);
+      
+      state.collaborationRound++;
+    }
+    
+    state.phase = 'complete';
+    console.log('✅ Workflow complete');
+    
+    return state;
+  }
+  
+  private async processAgentRound(state: SharedWorkflowState): Promise<void> {
+    const currentAgents = [...state.nextAgents];
+    state.activeAgents = currentAgents;
+    state.nextAgents = [];
+    
+    // Process agents in sequence (not parallel) for proper state sharing
+    for (const agentId of currentAgents) {
+      console.log(`🤖 Processing agent: ${agentId}`);
+      
+      try {
+        const contribution = await this.invokeAgent(agentId, state);
+        
+        // Update shared state with contribution
+        state.agentContributions[agentId] = contribution;
+        this.updateSharedKnowledge(state, contribution);
+        
+                 // Add message for UI - extract actual message from JSON if needed
+         let displayMessage = contribution.message;
+         
+         // If the message is raw JSON, try to extract the actual message
+         if (typeof contribution.message === 'string' && contribution.message.trim().startsWith('{')) {
+           try {
+             const jsonMatch = contribution.message.match(/\{[\s\S]*\}/);
+             if (jsonMatch) {
+               const cleanedJson = jsonMatch[0]
+                 .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+                 .replace(/\n/g, '\\n')
+                 .replace(/\r/g, '\\r')
+                 .replace(/\t/g, '\\t')
+                 .replace(/,\s*}/g, '}')
+                 .replace(/,\s*]/g, ']');
+               
+               const parsed = JSON.parse(cleanedJson);
+               displayMessage = parsed.message || 'Agent analysis completed';
+             }
+           } catch (error) {
+             displayMessage = 'Agent analysis completed';
+           }
+         }
+         
+         const message = {
+           id: `${agentId}-${Date.now()}`,
+           conversationId: state.conversationId,
+           senderId: agentId,
+           content: displayMessage,
+           type: 'text',
+           timestamp: new Date().toISOString(),
+           metadata: {
+             round: state.collaborationRound,
+             phase: state.phase,
+             knowledgeUpdates: contribution.knowledgeUpdates
+           }
+         };
+         
+         state.messages.push(message);
+         
+         // Stream the message in real-time if Socket.IO is available
+         if (this.io) {
+           this.io.to(`conversation:${state.conversationId}`).emit('new-message', message);
+           console.log(`📤 [STREAM] Emitted message from ${agentId}: ${displayMessage.substring(0, 100)}...`);
+         }
+        
+                 // Determine which agents should go next - only if they haven't contributed yet
+         const enabledAgents = contribution.enablesAgents
+           .map(role => this.getAgentIdByRole(role))
+           .filter((id): id is string => 
+             id !== undefined && 
+             this.teamAgents.includes(id) && 
+             !state.agentContributions[id] &&
+             !state.nextAgents.includes(id) &&
+             !currentAgents.includes(id) && // Don't enable agents that are currently processing
+             id !== agentId // Don't enable the current agent again
+           );
+         
+         state.nextAgents.push(...enabledAgents);
+        
+      } catch (error) {
+        console.error(`❌ Error processing agent ${agentId}:`, error);
+        state.error = `Agent ${agentId} failed: ${error.message}`;
+      }
+    }
+    
+    // Remove duplicates from nextAgents
+    state.nextAgents = [...new Set(state.nextAgents)];
+  }
+  
+  private async invokeAgent(agentId: string, state: SharedWorkflowState): Promise<AgentContribution> {
+    const agent = this.agentInfo.find(a => a.id === agentId);
+    if (!agent) {
+      throw new Error(`Agent ${agentId} not found`);
+    }
+    
+    const prompt = this.buildSharedStatePrompt(agentId, agent.role, state);
+    const response = await this.llm.invoke([new HumanMessage(prompt)]);
+    
+         try {
+       // Try to extract JSON from the response
+       const content = response.content as string;
+       console.log(`🔍 [PARSER] Raw response from ${agentId}:`, content.substring(0, 200) + '...');
+       
+       // First, try to find JSON in the response
+       const jsonMatch = content.match(/\{[\s\S]*\}/);
+       
+       if (jsonMatch) {
+         const jsonStr = jsonMatch[0];
+         console.log(`🔍 [PARSER] Found JSON match for ${agentId}:`, jsonStr.substring(0, 200) + '...');
+         
+         // Clean the JSON string to handle control characters
+         const cleanedJson = jsonStr
+           .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remove control characters
+           .replace(/\n/g, '\\n') // Escape newlines
+           .replace(/\r/g, '\\r') // Escape carriage returns
+           .replace(/\t/g, '\\t') // Escape tabs
+           .replace(/,\s*}/g, '}') // Remove trailing commas
+           .replace(/,\s*]/g, ']'); // Remove trailing commas in arrays
+         
+         console.log(`🔍 [PARSER] Cleaned JSON for ${agentId}:`, cleanedJson.substring(0, 200) + '...');
+         
+         const parsed = JSON.parse(cleanedJson);
+         
+         return {
+           agentId,
+           round: state.collaborationRound,
+           timestamp: new Date().toISOString(),
+           knowledgeUpdates: parsed.knowledgeUpdates || {},
+           dependsOn: parsed.dependsOn || [],
+           enablesAgents: parsed.enablesAgents || [],
+           status: 'complete',
+           message: parsed.message || 'Agent analysis completed',
+           reasoning: parsed.reasoning
+         };
+      } else {
+        // No JSON found, create a fallback contribution
+        console.log(`⚠️ No JSON found in response for ${agentId}, using fallback`);
+        
+        // Try to extract enabled agents from the text
+        const enabledAgents: string[] = [];
+        if (content.includes('designer')) enabledAgents.push('designer');
+        if (content.includes('frontend-developer')) enabledAgents.push('frontend-developer');
+        if (content.includes('backend-developer')) enabledAgents.push('backend-developer');
+        
+        return {
+          agentId,
+          round: state.collaborationRound,
+          timestamp: new Date().toISOString(),
+          knowledgeUpdates: {},
+          dependsOn: [],
+          enablesAgents: enabledAgents,
+          status: 'complete',
+          message: content,
+          reasoning: 'Used fallback parsing - no JSON found'
+        };
+      }
+      
+    } catch (error) {
+      console.error(`❌ Failed to parse agent response for ${agentId}:`, error);
+      
+      // Final fallback contribution
+      const content = response.content as string;
+      const enabledAgents: string[] = [];
+      if (content.includes('designer')) enabledAgents.push('designer');
+      if (content.includes('frontend-developer')) enabledAgents.push('frontend-developer');
+      if (content.includes('backend-developer')) enabledAgents.push('backend-developer');
+      
+      return {
+        agentId,
+        round: state.collaborationRound,
+        timestamp: new Date().toISOString(),
+        knowledgeUpdates: {},
+        dependsOn: [],
+        enablesAgents: enabledAgents,
+        status: 'complete',
+        message: content || 'Agent response was invalid',
+        reasoning: 'Failed to parse structured response'
+      };
+    }
+  }
+  
+     private buildSharedStatePrompt(agentId: string, role: string, state: SharedWorkflowState): string {
+     const baseContext = `
+You are a ${role} in a collaborative team working on: "${state.userRequest}"
+
+CURRENT SHARED KNOWLEDGE:
+${JSON.stringify(state.sharedKnowledge, null, 2)}
+
+PREVIOUS TEAM CONTRIBUTIONS:
+${Object.entries(state.agentContributions).map(([id, contrib]) => 
+  `${id}: ${contrib.message}`
+).join('\n')}
+
+AVAILABLE TEAM MEMBERS: ${this.teamAgents.join(', ')}
+
+IMPORTANT: You MUST respond with ONLY valid JSON. No text before or after the JSON.
+`;
+
+     const rolePrompts = {
+       coordinator: `${baseContext}
+As PROJECT COORDINATOR, analyze "${state.userRequest}" and provide specific requirements, decisions, and tasks.
+
+RESPOND WITH ONLY THIS JSON FORMAT (replace the placeholder text with your actual analysis):
+{
+  "knowledgeUpdates": {
+    "requirements": ["Create a visually appealing landing page", "Use vibrant colors and modern design", "Ensure responsive layout"],
+    "decisions": ["Use modern CSS framework", "Implement smooth animations", "Focus on user engagement"],
+    "tasks": ["Design wireframes", "Create color palette", "Plan responsive breakpoints"]
+  },
+  "dependsOn": [],
+  "enablesAgents": ["designer", "frontend-developer", "backend-developer"],
+  "message": "Project analysis: We need to create a beautiful, vibrant Hello World page with modern design principles, responsive layout, and engaging user experience. Key focus areas include visual appeal, color scheme, and interactive elements.",
+  "reasoning": "The user wants a beautiful and vibrant page, so we need strong design focus, modern web technologies, and attention to visual details."
+}`,
+
+                    designer: `${baseContext}
+As UI/UX DESIGNER, based on the coordinator's analysis of "${state.userRequest}", provide specific design decisions and recommendations.
+
+RESPOND WITH ONLY THIS JSON FORMAT (replace the placeholder text with your actual design analysis):
+{
+  "knowledgeUpdates": {
+    "decisions": ["Use gradient backgrounds for vibrancy", "Implement glassmorphism effects", "Choose bold typography"],
+    "tasks": ["Create color palette with vibrant hues", "Design hero section with animations", "Plan interactive elements"],
+    "requirements": ["Ensure accessibility compliance", "Optimize for mobile devices", "Include loading animations"]
+  },
+  "dependsOn": ["coordinator"],
+  "enablesAgents": ["frontend-developer"],
+  "message": "Design approach: I recommend a vibrant color scheme with gradients, glassmorphism effects for modern appeal, bold typography for impact, and smooth animations to create an engaging user experience. The page should be visually striking while maintaining excellent usability.",
+  "reasoning": "The user wants 'beautiful and vibrant', so I'm focusing on modern design trends like gradients, glassmorphism, and bold visual elements that create immediate visual impact."
+}`,
+
+                    'frontend-developer': `${baseContext}
+As FRONTEND DEVELOPER, based on the coordinator's requirements and designer's decisions for "${state.userRequest}", provide specific technical implementation details.
+
+RESPOND WITH ONLY THIS JSON FORMAT (replace the placeholder text with your actual technical analysis):
+{
+  "knowledgeUpdates": {
+    "decisions": ["Use React with TypeScript", "Implement CSS-in-JS for dynamic styling", "Add Framer Motion for animations"],
+    "integrationPoints": ["API endpoint for dynamic content", "WebSocket for real-time updates"],
+    "tasks": ["Set up React project structure", "Create reusable components", "Implement responsive design"]
+  },
+  "dependsOn": ["coordinator", "designer"],
+  "enablesAgents": ["backend-developer"],
+  "message": "Frontend approach: I'll use React with TypeScript for robust development, CSS-in-JS for dynamic styling capabilities, and Framer Motion for smooth animations. The implementation will focus on creating reusable components and ensuring responsive design across all devices.",
+  "reasoning": "React provides the flexibility needed for a vibrant, interactive page, TypeScript ensures code quality, and modern animation libraries will bring the design to life."
+}`,
+
+                    'backend-developer': `${baseContext}
+As BACKEND DEVELOPER, based on all previous team contributions for "${state.userRequest}", provide specific backend implementation details.
+
+RESPOND WITH ONLY THIS JSON FORMAT (replace the placeholder text with your actual backend analysis):
+{
+  "knowledgeUpdates": {
+    "decisions": ["Use Node.js with Express", "Implement RESTful API", "Add WebSocket support"],
+    "integrationPoints": ["Content management API", "Real-time messaging system"],
+    "tasks": ["Set up Express server", "Create API endpoints", "Implement WebSocket connections"],
+    "completedTasks": ["Technical analysis complete"]
+  },
+  "dependsOn": ["coordinator", "designer", "frontend-developer"],
+  "enablesAgents": [],
+  "message": "Backend approach: I'll implement a Node.js Express server with RESTful API endpoints for content management and WebSocket support for real-time features. The backend will provide the necessary infrastructure to support the vibrant, interactive frontend experience.",
+  "reasoning": "Node.js with Express provides the performance and flexibility needed, while WebSocket support enables real-time interactions that enhance the vibrant user experience."
+}`
+    };
+
+    return rolePrompts[role] || `${baseContext}\nProvide your contribution as a ${role}.`;
+  }
+  
+  private updateSharedKnowledge(state: SharedWorkflowState, contribution: AgentContribution): void {
+    const updates = contribution.knowledgeUpdates;
+    
+    // Append to shared knowledge arrays
+    if (updates.requirements) {
+      state.sharedKnowledge.projectRequirements += '\n' + updates.requirements.join('\n');
+    }
+    if (updates.decisions) {
+      state.sharedKnowledge.designDecisions.push(...updates.decisions);
+      state.sharedKnowledge.technicalDecisions.push(...updates.decisions);
+    }
+    if (updates.tasks) {
+      state.sharedKnowledge.implementationNotes.push(...updates.tasks);
+    }
+    if (updates.blockers) {
+      state.sharedKnowledge.blockers.push(...updates.blockers);
+    }
+    
+    console.log(`📝 Updated shared knowledge from ${contribution.agentId}`);
+  }
+  
+     private updateWorkflowPhase(state: SharedWorkflowState): void {
+     // Determine next phase based on contributions
+     if (state.agentContributions.coordinator && !state.agentContributions.designer) {
+       state.phase = 'coordination';
+     } else if (state.agentContributions.designer && !state.agentContributions['frontend-developer']) {
+       state.phase = 'collaboration';
+     } else if (Object.keys(state.agentContributions).length >= 3) {
+       state.phase = 'integration';
+     }
+     
+     // Check if we should continue or complete
+     const allTeamAgentsContributed = this.teamAgents.every(agentId => 
+       state.agentContributions[agentId] !== undefined
+     );
+     
+     if (state.nextAgents.length === 0 || state.collaborationRound >= state.maxRounds || allTeamAgentsContributed) {
+       state.phase = 'complete';
+     }
+   }
+
+  // Legacy method for backward compatibility
   public updateTeamAgents(agentOrchestrator: any): void {
     const allAgents = agentOrchestrator.getAllAgents();
     console.log('🔍 [WORKFLOW] All agents from orchestrator:', allAgents.map(a => `${a.name} (${a.role}) - ${a.id}`));
     
-    const agentMap = new Map<string, string>(); // role -> id mapping
+    // Convert to Agent format and set
+    const agents: Agent[] = allAgents.map(agent => ({
+      id: agent.id,
+      name: agent.name,
+      role: agent.role,
+      avatar: agent.avatar,
+      description: agent.description,
+      config: agent.config,
+      capabilities: agent.capabilities,
+      isActive: agent.isActive
+    }));
     
-    allAgents.forEach(agent => {
-      agentMap.set(agent.role, agent.id);
-    });
-    
-    // Map roles to actual agent IDs
-    this.teamAgents = ["coordinator", "designer", "frontend-developer", "backend-developer"]
-      .map(role => agentMap.get(role))
-      .filter(id => id !== undefined) as string[];
-    
-    console.log('🔄 [WORKFLOW] Updated team agents:', this.teamAgents);
-    console.log('🔄 [WORKFLOW] Agent mapping:', Object.fromEntries(agentMap));
-    console.log('🔍 [WORKFLOW] Team agents length:', this.teamAgents.length);
-    console.log('🔍 [WORKFLOW] Expected roles:', ["coordinator", "designer", "frontend-developer", "backend-developer"]);
-    
-    // Recreate config with new agent IDs
-    this.config = this.createDefaultConfig();
+    this.setAgents(agents);
   }
 
-  // Get agent information from database
-  private async getAgentInfo(): Promise<any[]> {
-    try {
-      const agents = await this.prisma.agent.findMany({
-        select: {
-          id: true,
-          name: true,
-          role: true
-        }
-      });
-      return agents;
-    } catch (error) {
-      console.error('Error fetching agent info:', error);
-      return [];
-    }
-  }
-
-  // Get agent information synchronously (cached)
-  private getAgentInfoSync(): any[] {
-    // This is a fallback - in a real implementation, you'd cache the agent info
-    // For now, we'll assume the teamAgents are in the correct order
-    const roleOrder = ["coordinator", "designer", "frontend-developer", "backend-developer"];
-    
-    console.log("🔍 [AGENT_INFO] Team agents length:", this.teamAgents.length);
-    console.log("🔍 [AGENT_INFO] Role order length:", roleOrder.length);
-    
-    if (this.teamAgents.length === 0) {
-      console.warn("⚠️ [AGENT_INFO] No team agents found!");
-      return [];
-    }
-    
-    return this.teamAgents.map((agentId, index) => {
-      const role = roleOrder[index] || "unknown";
-      console.log(`🔍 [AGENT_INFO] Mapping ${agentId} -> ${role}`);
-      return {
-        id: agentId,
-        name: role,
-        role: role
-      };
-    });
-  }
-
-  // Extract tagged agents from text content
-  private async extractTaggedAgentsFromText(content: string): Promise<any> {
-    const taggedAgents: string[] = [];
-    const agentInfo = await this.getAgentInfo();
-    
-    // Look for role-based tags (@designer, @frontend-developer, etc.)
-    const roleTags = ["@designer", "@frontend-developer", "@backend-developer"];
-    roleTags.forEach(roleTag => {
-      if (content.includes(roleTag)) {
-        const role = roleTag.substring(1); // Remove @
-        const agent = agentInfo.find(a => a.role === role);
-        if (agent) {
-          taggedAgents.push(agent.id);
-        }
-      }
-    });
-    
-    console.log("🔍 [PARSER] Extracted tagged agents from text:", taggedAgents);
-    
-    return { 
-      message: content, 
-      taggedAgents: taggedAgents,
-      requirementsComplete: false 
-    };
-  }
-
-  private createDefaultConfig(): WorkflowConfig {
-    // Create nodes dynamically from team agents
-    const nodes = this.teamAgents.map((agentId, index) => {
-      const agentNames: Record<string, string> = {
-        "coordinator": "Project Coordinator",
-        "designer": "UI/UX Designer", 
-        "frontend-developer": "Frontend Developer",
-        "backend-developer": "Backend Developer"
-      };
-      
-      const agentCapabilities: Record<string, string[]> = {
-        "coordinator": ["planning", "coordination"],
-        "designer": ["wireframes", "design"],
-        "frontend-developer": ["react", "ui"],
-        "backend-developer": ["api", "database"]
-      };
-      
-      return {
-        id: agentId,
-        name: agentNames[agentId] || agentId,
-        role: agentId,
-        capabilities: agentCapabilities[agentId] || [],
-        priority: index + 1
-      };
-    });
-
-    // Create routing rules dynamically
-    const routingRules = [
-      // Coordinator always goes first - but only if it hasn't responded yet
-      {
-        condition: (state) => {
-          const coordinatorId = this.teamAgents.find(id => {
-            const agent = this.getAgentInfoSync().find(a => a.id === id);
-            return agent && agent.role === "coordinator";
-          });
-          const hasCoordinatorOutput = coordinatorId ? Boolean(state.agentOutputs[coordinatorId]) : false;
-          console.log(`🔍 [ROUTING] Coordinator condition check: phase=${state.phase}, coordinatorId=${coordinatorId}, hasOutput=${hasCoordinatorOutput}`);
-          return Boolean(state.phase === "coordinator_response" && coordinatorId && !hasCoordinatorOutput);
-        },
-        targetNode: "coordinator",
-        priority: 1
-      }
-    ];
-
-    // Add routing rules for tagged agents
-    this.teamAgents.forEach((agentId, index) => {
-      const agent = this.getAgentInfoSync().find(a => a.id === agentId);
-      if (agent && agent.role !== "coordinator") {
-        routingRules.push({
-          condition: (state) => 
-            state.phase === "tagged_response" && 
-            Array.isArray(state.taggedAgents) && 
-            state.taggedAgents.includes(agentId) && 
-            !state.agentOutputs[agentId],
-          targetNode: agentId,
-          priority: index + 2
-        });
-      }
-    });
-
-    return {
-      nodes,
-      routingRules,
-      phases: [
-        {
-          name: "coordinator_response",
-          requiredAgents: ["coordinator"],
-          completionCriteria: (state) => {
-            const coordinatorId = this.teamAgents.find(id => {
-              const agent = this.getAgentInfoSync().find(a => a.id === id);
-              return agent && agent.role === "coordinator";
-            });
-            return coordinatorId ? Boolean(state.agentOutputs[coordinatorId]) : false;
-          },
-          nextPhase: "tagged_response"
-        },
-        {
-          name: "tagged_response",
-          requiredAgents: [],
-          completionCriteria: (state) => {
-            if (!state.taggedAgents || state.taggedAgents.length === 0) {
-              return true; // No agents to respond to
-            }
-            // Check if all tagged agents have responded
-            return state.taggedAgents.every(agentId => state.agentOutputs[agentId]);
-          },
-          nextPhase: "complete"
-        }
-      ]
-    };
-  }
-
-  private buildWorkflowGraph(): any {
-    // Create a simple workflow without LangGraph for now
-    // We'll implement a custom workflow engine
-    return {
-      async invoke(input: any): Promise<any> {
-        return { state: input.state };
-      }
-    };
-  }
-
-  private async coordinatorNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-    try {
-      console.log("🎯 Coordinator node executing...");
-      console.log("🔍 [COORDINATOR] Team agents:", this.teamAgents);
-      console.log("🔍 [COORDINATOR] Agent info sync:", this.getAgentInfoSync());
-      
-      // Find the actual coordinator agent ID
-      const coordinatorId = this.teamAgents.find(id => {
-        const agent = this.getAgentInfoSync().find(a => a.id === id);
-        console.log("🔍 [COORDINATOR] Checking agent:", id, "->", agent);
-        return agent && agent.role === "coordinator";
-      });
-      
-      console.log("🔍 [COORDINATOR] Found coordinator ID:", coordinatorId);
-      
-      if (!coordinatorId) {
-        throw new Error("Coordinator agent not found");
-      }
-      
-      const prompt = await this.buildCoordinatorPrompt(state);
-      const response = await this.llm.invoke([new HumanMessage(prompt)]);
-      
-      const output = await this.parseCoordinatorOutput(response.content as string);
-      
-      // Extract tagged agents from coordinator response
-      const taggedAgents = output.taggedAgents || [];
-      console.log(`🎯 Coordinator extracted taggedAgents:`, taggedAgents);
-      
-      return {
-        agentOutputs: {
-          ...state.agentOutputs,
-          [coordinatorId]: output
-        },
-        taggedAgents,
-        workflowHistory: [
-          ...state.workflowHistory,
-          {
-            id: `coordinator_${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            node: coordinatorId,
-            input: state.currentInput,
-            output,
-            status: "success"
-          }
-        ]
-      };
-    } catch (error) {
-      console.error("❌ Coordinator node error:", error);
-      return {
-        error: `Coordinator error: ${error}`,
-        retryCount: state.retryCount + 1
-      };
-    }
-  }
-
-  private async designerNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-    try {
-      console.log("🎨 Designer node executing...");
-      
-      const prompt = this.buildDesignerPrompt(state);
-      const response = await this.llm.invoke([new HumanMessage(prompt)]);
-      
-      const output = this.parseDesignerOutput(response.content as string);
-      
-      return {
-        agentOutputs: {
-          ...state.agentOutputs,
-          designer: output
-        },
-        workflowHistory: [
-          ...state.workflowHistory,
-          {
-            id: `designer_${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            node: "designer",
-            input: state.currentInput,
-            output,
-            status: "success"
-          }
-        ]
-      };
-    } catch (error) {
-      console.error("❌ Designer node error:", error);
-      return {
-        error: `Designer error: ${error}`,
-        retryCount: state.retryCount + 1
-      };
-    }
-  }
-
-  private async frontendNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-    try {
-      console.log("⚛️ Frontend node executing...");
-      
-      const prompt = this.buildFrontendPrompt(state);
-      const response = await this.llm.invoke([new HumanMessage(prompt)]);
-      
-      const output = this.parseFrontendOutput(response.content as string);
-      
-             return {
-         agentOutputs: {
-           ...state.agentOutputs,
-           "frontend-developer": output
-         },
-         workflowHistory: [
-           ...state.workflowHistory,
-           {
-             id: `frontend-developer_${Date.now()}`,
-             timestamp: new Date().toISOString(),
-             node: "frontend-developer",
-             input: state.currentInput,
-             output,
-             status: "success"
-           }
-         ]
-       };
-    } catch (error) {
-      console.error("❌ Frontend node error:", error);
-      return {
-        error: `Frontend error: ${error}`,
-        retryCount: state.retryCount + 1
-      };
-    }
-  }
-
-  private async backendNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-    try {
-      console.log("🔧 Backend node executing...");
-      
-      const prompt = this.buildBackendPrompt(state);
-      const response = await this.llm.invoke([new HumanMessage(prompt)]);
-      
-      const output = this.parseBackendOutput(response.content as string);
-      
-             return {
-         agentOutputs: {
-           ...state.agentOutputs,
-           "backend-developer": output
-         },
-         workflowHistory: [
-           ...state.workflowHistory,
-           {
-             id: `backend-developer_${Date.now()}`,
-             timestamp: new Date().toISOString(),
-             node: "backend-developer",
-             input: state.currentInput,
-             output,
-             status: "success"
-           }
-         ]
-       };
-    } catch (error) {
-      console.error("❌ Backend node error:", error);
-      return {
-        error: `Backend error: ${error}`,
-        retryCount: state.retryCount + 1
-      };
-    }
-  }
-
-  private async routerNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-    console.log("🔄 Router node executing...");
-    
-    // Check for errors first
-    if (state.error) {
-      return { error: state.error };
-    }
-
-    // Check if workflow is complete
-    if (state.phase === "complete") {
-      return { phase: "complete" };
-    }
-
-    // Check if current phase is complete and transition to next phase
-    const currentPhase = this.config.phases.find(p => p.name === state.phase);
-    if (currentPhase && currentPhase.completionCriteria(state)) {
-      console.log(`✅ Phase '${state.phase}' complete, transitioning to '${currentPhase.nextPhase}'`);
-      return { phase: currentPhase.nextPhase };
-    }
-
-    return {};
-  }
-
-  private async executeAgentNode(agentId: string, state: WorkflowState): Promise<Partial<WorkflowState>> {
-    try {
-      console.log(`🎯 ${agentId} node executing...`);
-      
-      const prompt = this.buildAgentPrompt(agentId, state);
-      const response = await this.llm.invoke([new HumanMessage(prompt)]);
-      
-      const output = this.parseAgentOutput(agentId, response.content as string);
-      
-      return {
-        agentOutputs: {
-          ...state.agentOutputs,
-          [agentId]: output
-        },
-        workflowHistory: [
-          ...state.workflowHistory,
-          {
-            id: `${agentId}_${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            node: agentId,
-            input: state.currentInput,
-            output,
-            status: "success"
-          }
-        ]
-      };
-    } catch (error) {
-      console.error(`❌ ${agentId} node error:`, error);
-      return {
-        error: `${agentId} error: ${error}`,
-        retryCount: state.retryCount + 1
-      };
-    }
-  }
-
-  private async errorHandlerNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-    console.log("🚨 Error handler executing...");
-    
-    if (state.retryCount >= 3) {
-      return {
-        error: "Max retries exceeded",
-        phase: "complete"
-      };
-    }
-
-    // Reset error and retry
-    return {
-      error: undefined,
-      retryCount: state.retryCount
-    };
-  }
-
-  private routeByState(state: WorkflowState): string {
-    // Check for errors
-    if (state.error) {
-      return "error_handler";
-    }
-
-    // Check if workflow is complete
-    if (state.phase === "complete") {
-      return "end";
-    }
-
-    console.log(`🔍 Routing for phase: ${state.phase}, taggedAgents:`, state.taggedAgents);
-    console.log(`🔍 Current agentOutputs:`, Object.keys(state.agentOutputs));
-    console.log(`🔍 Team agents:`, this.teamAgents);
-
-    // Apply routing rules
-    const applicableRules = this.config.routingRules
-      .filter(rule => rule.condition(state))
-      .sort((a, b) => b.priority - a.priority);
-
-    console.log(`🔍 Applicable rules:`, applicableRules.map(r => r.targetNode));
-
-    if (applicableRules.length > 0) {
-      console.log(`🎯 Selected node: ${applicableRules[0].targetNode}`);
-      return applicableRules[0].targetNode;
-    }
-
-    // If no applicable rules, check if we should transition phases
-    if (state.phase === "coordinator_response" && Object.keys(state.agentOutputs).length > 0) {
-      console.log(`🔄 No more rules, transitioning to next phase`);
-      return "router"; // This will trigger phase transition
-    }
-
-    // Default to coordinator only if we're in coordinator_response phase and no coordinator output exists
-    const coordinatorId = this.teamAgents.find(id => {
-      const agent = this.getAgentInfoSync().find(a => a.id === id);
-      return agent && agent.role === "coordinator";
-    });
-    
-    if (state.phase === "coordinator_response" && coordinatorId && !state.agentOutputs[coordinatorId]) {
-      console.log(`🎯 Defaulting to coordinator`);
-      return "coordinator";
-    }
-
-    console.log(`🔄 No applicable rules, ending workflow`);
-    return "end";
-  }
-
-  // Prompt builders
-  private async buildCoordinatorPrompt(state: WorkflowState): Promise<string> {
-    // Get agent info from the database to map IDs to roles
-    const agentInfo = await this.getAgentInfo();
-    const availableAgents = this.teamAgents.filter(agentId => {
-      const agent = agentInfo.find(a => a.id === agentId);
-      return agent && agent.role !== "coordinator";
-    });
-    
-    const agentTags = availableAgents.map(agentId => {
-      const agent = agentInfo.find(a => a.id === agentId);
-      return `@${agent?.role || agentId}`;
-    }).join(", ");
-    
-    const agentIds = availableAgents.map(agent => `"${agent}"`).join(", ");
-    
-    console.log('🔍 [COORDINATOR] Available agents:', availableAgents);
-    console.log('🔍 [COORDINATOR] Agent tags:', agentTags);
-    console.log('🔍 [COORDINATOR] Agent IDs:', agentIds);
-    
-    return `You are a Project Coordinator managing an e-commerce platform development project.
-
-Current Input: ${state.currentInput}
-
-Your role is to:
-1. Analyze the current input and project requirements
-2. Provide initial project planning and coordination
-3. Tag relevant team members using ${agentTags}
-4. Set clear expectations for the team
-
-IMPORTANT: 
-- In your message, tag the team members you want to respond using ${agentTags} format.
-- You MUST include the taggedAgents array in your JSON response.
-- Use EXACTLY these agent IDs: [${agentIds}]
-
-Respond with a JSON object containing:
-{
-  "analysis": "Your analysis of the project requirements",
-  "projectPlan": "High-level project plan and timeline", 
-  "teamRoles": "Clear definition of each team member's responsibilities",
-  "successCriteria": "What defines success for this project",
-  "taggedAgents": [${agentIds}],
-  "message": "Your response message with @tags for team members"
-}
-
-IMPORTANT: Ensure your JSON is valid - no newlines or special characters in string values.`;
-  }
-
-  private buildDesignerPrompt(state: WorkflowState): string {
-    return `You are a UI/UX Designer working on an e-commerce platform.
-
-Current Input: ${state.currentInput}
-Coordinator Analysis: ${state.agentOutputs.coordinator ? JSON.stringify(state.agentOutputs.coordinator, null, 2) : "Not available yet"}
-
-Your role is to:
-1. Provide initial design thinking and wireframe concepts
-2. Suggest modern UI/UX patterns for e-commerce
-3. Outline the user journey and key screens needed
-4. Consider mobile-first responsive design
-
-Respond with a JSON object containing:
-{
-  "designApproach": "Your overall design philosophy and approach",
-  "keyScreens": ["Homepage", "Product Listing", "Product Detail", "Cart", "Checkout"],
-  "wireframeConcepts": "High-level wireframe descriptions for each screen",
-  "userJourney": "Main user flows and interactions",
-  "designSystem": "Proposed design system and components",
-  "message": "Your design response and initial concepts"
-}`;
-  }
-
-  private buildFrontendPrompt(state: WorkflowState): string {
-    return `You are a Frontend Developer working on an e-commerce platform.
-
-Current Input: ${state.currentInput}
-Designer Concepts: ${state.agentOutputs.designer ? JSON.stringify(state.agentOutputs.designer, null, 2) : "Not available yet"}
-
-Your role is to:
-1. Provide technical architecture for the frontend
-2. Suggest modern React patterns and technologies
-3. Outline component structure and state management
-4. Consider performance and scalability
-
-Respond with a JSON object containing:
-{
-  "techStack": ["React", "TypeScript", "Tailwind CSS", "State Management"],
-  "componentArchitecture": "Proposed component hierarchy and structure",
-  "stateManagement": "How to handle application state and data flow",
-  "performanceConsiderations": "Optimization strategies and best practices",
-  "developmentApproach": "Development methodology and tools",
-  "message": "Your technical response and implementation approach"
-}`;
-  }
-
-  private buildAgentPrompt(agentId: string, state: WorkflowState): string {
-    // Find coordinator output
-    const coordinatorId = this.teamAgents.find(id => {
-      const agent = this.getAgentInfoSync().find(a => a.id === id);
-      return agent && agent.role === "coordinator";
-    });
-    const coordinatorOutput = coordinatorId ? state.agentOutputs[coordinatorId] : null;
-    
-    console.log(`🔍 [AGENT_PROMPT] Building prompt for ${agentId}`);
-    console.log(`🔍 [AGENT_PROMPT] Coordinator ID: ${coordinatorId}`);
-    console.log(`🔍 [AGENT_PROMPT] Coordinator output exists: ${!!coordinatorOutput}`);
-    
-    const agentPrompts: Record<string, string> = {
-      "designer": `You are a UI/UX Designer working on an e-commerce platform.
-
-IMPORTANT: You are responding to the COORDINATOR'S ANALYSIS, not the original user message.
-
-Original User Request: ${state.currentInput}
-Coordinator Analysis: ${coordinatorOutput ? JSON.stringify(coordinatorOutput, null, 2) : "Not available yet"}
-
-Your role is to:
-1. Review the coordinator's analysis and project plan
-2. Provide design thinking and wireframe concepts based on the coordinator's requirements
-3. Suggest modern UI/UX patterns for e-commerce
-4. Outline the user journey and key screens needed
-5. Consider mobile-first responsive design
-
-IMPORTANT: Base your response on the coordinator's analysis, not the original user request.
-
-Respond with a JSON object containing:
-{
-  "designApproach": "Your overall design philosophy and approach based on coordinator's analysis",
-  "keyScreens": ["Homepage", "Product Listing", "Product Detail", "Cart", "Checkout"],
-  "wireframeConcepts": "High-level wireframe descriptions for each screen",
-  "userJourney": "Main user flows and interactions",
-  "designSystem": "Proposed design system and components",
-  "message": "Your design response based on coordinator's analysis"
-}`,
-      "frontend-developer": `You are a Frontend Developer working on an e-commerce platform.
-
-IMPORTANT: You are responding to the COORDINATOR'S ANALYSIS, not the original user message.
-
-Original User Request: ${state.currentInput}
-Coordinator Analysis: ${coordinatorOutput ? JSON.stringify(coordinatorOutput, null, 2) : "Not available yet"}
-
-Your role is to:
-1. Review the coordinator's analysis and project plan
-2. Provide technical architecture for the frontend based on coordinator's requirements
-3. Suggest modern React patterns and technologies
-4. Outline component structure and state management
-5. Consider performance and scalability
-
-IMPORTANT: Base your response on the coordinator's analysis, not the original user request.
-
-Respond with a JSON object containing:
-{
-  "techStack": ["React", "TypeScript", "Tailwind CSS", "State Management"],
-  "componentArchitecture": "Proposed component hierarchy and structure",
-  "stateManagement": "How to handle application state and data flow",
-  "performanceConsiderations": "Optimization strategies and best practices",
-  "developmentApproach": "Development methodology and tools",
-  "message": "Your technical response based on coordinator's analysis"
-}`,
-      "backend-developer": `You are a Backend Developer working on an e-commerce platform.
-
-IMPORTANT: You are responding to the COORDINATOR'S ANALYSIS, not the original user message.
-
-Original User Request: ${state.currentInput}
-Coordinator Analysis: ${coordinatorOutput ? JSON.stringify(coordinatorOutput, null, 2) : "Not available yet"}
-
-Your role is to:
-1. Review the coordinator's analysis and project plan
-2. Design the backend architecture and API structure based on coordinator's requirements
-3. Plan database schema and data models
-4. Consider security, scalability, and performance
-5. Outline integration points and third-party services
-
-IMPORTANT: Base your response on the coordinator's analysis, not the original user request.
-
-Respond with a JSON object containing:
-{
-  "backendArchitecture": "Overall backend architecture and technology choices",
-  "apiDesign": "RESTful API endpoints and data structures",
-  "databaseSchema": "Database design, tables, and relationships",
-  "securityMeasures": "Authentication, authorization, and security considerations",
-  "scalabilityPlan": "How to handle growth and performance optimization",
-  "message": "Your backend response based on coordinator's analysis"
-}`
-    };
-
-    return agentPrompts[agentId] || `You are an agent with ID: ${agentId}. Please respond to the coordinator's analysis: ${coordinatorOutput ? JSON.stringify(coordinatorOutput, null, 2) : "No coordinator analysis available"}`;
-  }
-
-  private buildBackendPrompt(state: WorkflowState): string {
-    return `You are a Backend Developer working on an e-commerce platform.
-
-Current Input: ${state.currentInput}
-Frontend Architecture: ${state.agentOutputs["frontend-developer"] ? JSON.stringify(state.agentOutputs["frontend-developer"], null, 2) : "Not available yet"}
-
-Your role is to:
-1. Design the backend architecture and API structure
-2. Plan database schema and data models
-3. Consider security, scalability, and performance
-4. Outline integration points and third-party services
-
-Respond with a JSON object containing:
-{
-  "backendArchitecture": "Overall backend architecture and technology choices",
-  "apiDesign": "RESTful API endpoints and data structures",
-  "databaseSchema": "Database design, tables, and relationships",
-  "securityMeasures": "Authentication, authorization, and security considerations",
-  "scalabilityPlan": "How to handle growth and performance optimization",
-  "message": "Your backend response and technical architecture"
-}`;
-  }
-
-  // Output parsers
-  private async parseCoordinatorOutput(content: string): Promise<any> {
-    try {
-      console.log("🔍 [PARSER] Raw coordinator output:", content);
-      
-      // Try to find JSON in the content
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        let jsonString = jsonMatch[0];
-        
-        // Clean up common JSON issues
-        jsonString = jsonString
-          // Replace newlines and carriage returns in string values with spaces
-          .replace(/"([^"]*?)(\n|\r)([^"]*?)"/g, '"$1 $3"')
-          // Replace tabs with spaces
-          .replace(/\t/g, ' ')
-          // Remove any other control characters
-          .replace(/[\x00-\x1F\x7F]/g, ' ')
-          // Fix common LLM JSON issues
-          .replace(/,\s*}/g, '}')  // Remove trailing commas
-          .replace(/,\s*]/g, ']'); // Remove trailing commas in arrays
-        
-        try {
-          const parsed = JSON.parse(jsonString);
-          console.log("✅ [PARSER] Successfully parsed coordinator output:", parsed);
-          return parsed;
-        } catch (jsonError) {
-          console.warn("⚠️ [PARSER] JSON parsing failed after cleanup, trying fallback:", jsonError);
-          // If JSON parsing still fails, try to extract just the taggedAgents
-          return this.extractTaggedAgentsFromText(content);
-        }
-      }
-      
-      // If no JSON found, try to extract tagged agents from the message
-      return await this.extractTaggedAgentsFromText(content);
-    } catch (error) {
-      console.error("❌ [PARSER] Failed to parse coordinator output:", error);
-      
-      // Fallback: extract tagged agents from message
-      return await this.extractTaggedAgentsFromText(content);
-    }
-  }
-
-  private parseDesignerOutput(content: string): any {
-    try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-    } catch (error) {
-      console.error("Failed to parse designer output:", error);
-    }
-    return { message: content, designComplete: false };
-  }
-
-  private parseFrontendOutput(content: string): any {
-    try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-    } catch (error) {
-      console.error("Failed to parse frontend output:", error);
-    }
-    return { message: content, frontendComplete: false };
-  }
-
-  private parseAgentOutput(agentId: string, content: string): any {
-    try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-    } catch (error) {
-      console.error(`Failed to parse ${agentId} output:`, error);
-    }
-    return { message: content, [`${agentId}Complete`]: false };
-  }
-
-  private parseBackendOutput(content: string): any {
-    try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-    } catch (error) {
-      console.error("Failed to parse backend output:", error);
-    }
-    return { message: content, backendComplete: false };
-  }
-
-  // Custom workflow execution engine
-  private async executeWorkflow(state: WorkflowState): Promise<WorkflowState> {
-    let currentState = { ...state };
-    let maxIterations = 10;
-    let iteration = 0;
-
-    while (iteration < maxIterations && currentState.phase !== "complete") {
-      console.log(`🔄 Workflow iteration ${iteration + 1}, phase: ${currentState.phase}`);
-      
-      // Determine next node to execute
-      const nextNode = this.routeByState(currentState);
-      
-      if (nextNode === "end") {
-        currentState.phase = "complete";
-        break;
-      }
-
-             // Execute the node
-       let nodeResult: Partial<WorkflowState> = {};
-       
-       switch (nextNode) {
-         case "coordinator":
-           nodeResult = await this.coordinatorNode(currentState);
-           break;
-         case "error_handler":
-           nodeResult = await this.errorHandlerNode(currentState);
-           break;
-         default:
-           // Handle dynamic agent nodes
-           if (this.teamAgents.includes(nextNode)) {
-             nodeResult = await this.executeAgentNode(nextNode, currentState);
-           } else {
-             console.warn(`Unknown node: ${nextNode}`);
-           }
-           break;
-       }
-
-      // Update state
-      currentState = { ...currentState, ...nodeResult };
-      
-      // Check for phase transitions
-      const routerResult = await this.routerNode(currentState);
-      currentState = { ...currentState, ...routerResult };
-      
-      iteration++;
-    }
-
-    return currentState;
-  }
-
-  // Public API
-  public async processMessage(message: Message): Promise<WorkflowState> {
-    const initialState: WorkflowState = {
-      conversationId: message.conversationId,
-      phase: "coordinator_response",
-      activeAgents: [],
-      completedTasks: [],
-      pendingTasks: [],
-      agentOutputs: {},
-      messages: [message],
-      currentInput: message.content,
-      workflowHistory: [],
-      taggedAgents: [],
-      retryCount: 0
-    };
-
-    try {
-      console.log("🚀 Starting workflow execution...");
-      const result = await this.executeWorkflow(initialState);
-      console.log("✅ Workflow execution completed");
-      return result;
-    } catch (error) {
-      console.error("❌ Workflow execution error:", error);
-      return {
-        ...initialState,
-        error: `Workflow error: ${error}`,
-        phase: "complete"
-      };
-    }
-  }
-
-  public getWorkflowState(conversationId: string): WorkflowState | null {
-    // In a real implementation, this would load from persistent storage
+  // Legacy method for backward compatibility
+  public getWorkflowState(conversationId: string): SharedWorkflowState | null {
     return null;
   }
 
-  public saveWorkflowState(state: WorkflowState): void {
-    // In a real implementation, this would save to persistent storage
+  // Legacy method for backward compatibility
+  public saveWorkflowState(state: SharedWorkflowState): void {
     console.log("💾 Saving workflow state:", state);
   }
 }

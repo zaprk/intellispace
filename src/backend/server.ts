@@ -42,6 +42,9 @@ const agentOrchestrator = new AgentOrchestrator(
 // Initialize workflow orchestrator
 const workflowOrchestrator = new WorkflowOrchestrator(prisma);
 
+// Set up Socket.IO for streaming
+workflowOrchestrator.setSocketIO(io);
+
 // Update workflow with actual agent IDs after agents are loaded
 const updateWorkflowAgents = () => {
   workflowOrchestrator.updateTeamAgents(agentOrchestrator);
@@ -196,49 +199,28 @@ app.post('/api/messages', async (req, res) => {
         });
         
         try {
-          console.log('🚀 [WORKFLOW] Starting workflow processing...');
+          console.log('🚀 [WORKFLOW] Starting fixed workflow processing...');
           const workflowResult = await workflowOrchestrator.processMessage(message as unknown as Message);
           
-          console.log('✅ [WORKFLOW] Workflow processing completed successfully');
+          console.log('✅ [WORKFLOW] Fixed workflow processing completed successfully');
           console.log('📊 [WORKFLOW] Workflow state:', {
             phase: workflowResult.phase,
-            taggedAgents: workflowResult.taggedAgents,
-            agentOutputs: Object.keys(workflowResult.agentOutputs),
+            collaborationRound: workflowResult.collaborationRound,
+            messagesCount: workflowResult.messages.length,
             error: workflowResult.error
           });
           
           // Save the workflow state
           workflowOrchestrator.saveWorkflowState(workflowResult);
           
-          // Create response messages for each agent output
-          const responseMessages: any[] = [];
-          
-          for (const [agentId, output] of Object.entries(workflowResult.agentOutputs)) {
-            if (output.message) {
-              console.log(`📤 [WORKFLOW] Creating response for agent: ${agentId}`);
-              const responseMessage = await conversationService.createMessage({
-                content: output.message,
-                conversationId: req.body.conversationId,
-                senderId: agentId,
-                type: 'text' as const,
-                metadata: {
-                  workflowPhase: workflowResult.phase,
-                  agentOutput: output,
-                  workflowStep: workflowResult.workflowHistory.find(h => h.node === agentId)
-                }
-              });
-              
-              responseMessages.push(responseMessage);
-            }
-          }
-          
-          console.log('✅ [WORKFLOW] All workflow responses created');
-          
-          // Return both the original message and workflow responses
+          // Return the complete workflow state
           res.json({
             message,
-            workflowResponses: responseMessages,
-            workflowState: workflowResult
+            workflowMessages: workflowResult.messages,
+            workflowState: workflowResult,
+            messageCount: workflowResult.messages.length,
+            phase: workflowResult.phase,
+            sharedKnowledge: workflowResult.sharedKnowledge
           });
         } catch (workflowError) {
           console.error('❌ [WORKFLOW] Workflow processing error:', workflowError);
@@ -316,37 +298,20 @@ app.post('/api/workflow/process', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
     
-    console.log('🔄 Processing message through LangGraph workflow:', message.content);
+    console.log('🔄 Processing message through fixed LangGraph workflow:', message.content);
     
     const workflowResult = await workflowOrchestrator.processMessage(message as Message);
     
     // Save the workflow state
     workflowOrchestrator.saveWorkflowState(workflowResult);
     
-    // Create response messages for each agent output
-    const responseMessages: any[] = [];
-    
-    for (const [agentId, output] of Object.entries(workflowResult.agentOutputs)) {
-      if (output.message) {
-        const responseMessage = await conversationService.createMessage({
-          content: output.message,
-          conversationId: message.conversationId,
-          senderId: agentId,
-          type: 'text' as const,
-          metadata: {
-            workflowPhase: workflowResult.phase,
-            agentOutput: output,
-            workflowStep: workflowResult.workflowHistory.find(h => h.node === agentId)
-          }
-        });
-        
-        responseMessages.push(responseMessage);
-      }
-    }
-    
+    // Return the complete workflow state
     res.json({
       workflowState: workflowResult,
-      responseMessages,
+      workflowMessages: workflowResult.messages,
+      messageCount: workflowResult.messages.length,
+      phase: workflowResult.phase,
+      sharedKnowledge: workflowResult.sharedKnowledge,
       success: true
     });
     
@@ -568,42 +533,27 @@ io.on('connection', (socket) => {
         });
         
         try {
-          console.log('🚀 [WORKFLOW] Starting workflow processing...');
+          console.log('🚀 [WORKFLOW] Starting fixed workflow processing...');
           const workflowResult = await workflowOrchestrator.processMessage(message as unknown as Message);
           
-          console.log('✅ [WORKFLOW] Workflow processing completed successfully');
+          console.log('✅ [WORKFLOW] Fixed workflow processing completed successfully');
           console.log('📊 [WORKFLOW] Workflow state:', {
             phase: workflowResult.phase,
-            taggedAgents: workflowResult.taggedAgents,
-            agentOutputs: Object.keys(workflowResult.agentOutputs),
+            collaborationRound: workflowResult.collaborationRound,
+            messagesCount: workflowResult.messages.length,
             error: workflowResult.error
           });
           
           // Save the workflow state
           workflowOrchestrator.saveWorkflowState(workflowResult);
           
-          // Create response messages for each agent output
-          for (const [agentId, output] of Object.entries(workflowResult.agentOutputs)) {
-            if (output.message) {
-              console.log(`📤 [WORKFLOW] Creating response for agent: ${agentId}`);
-              const responseMessage = await conversationService.createMessage({
-                content: output.message,
-                conversationId: data.conversationId,
-                senderId: agentId,
-                type: 'text' as const,
-                metadata: {
-                  workflowPhase: workflowResult.phase,
-                  agentOutput: output,
-                  workflowStep: workflowResult.workflowHistory.find(h => h.node === agentId)
-                }
-              });
-              
-              // Broadcast the response message
-              io.to(`conversation:${data.conversationId}`).emit('new-message', responseMessage);
-            }
+          // Broadcast all the messages from the workflow result
+          for (const workflowMessage of workflowResult.messages) {
+            console.log(`📤 [WORKFLOW] Broadcasting message from ${workflowMessage.senderId}: ${workflowMessage.content.substring(0, 100)}...`);
+            io.to(`conversation:${data.conversationId}`).emit('new-message', workflowMessage);
           }
           
-          console.log('✅ [WORKFLOW] All workflow responses created and broadcasted');
+          console.log(`✅ [WORKFLOW] All ${workflowResult.messages.length} workflow messages broadcasted`);
         } catch (workflowError) {
           console.error('❌ [WORKFLOW] Workflow processing error:', workflowError);
           console.log('🔄 [FALLBACK] Falling back to AgentOrchestrator...');
