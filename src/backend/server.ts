@@ -189,53 +189,12 @@ app.post('/api/messages', async (req, res) => {
   try {
     const message = await conversationService.createMessage(req.body);
     
-          // Process the message through LangGraph workflow if it's a user message
-      if (req.body.senderId === 'user' || req.body.senderId === 'user-agent') {
-        console.log('🔄 Processing user message through LangGraph workflow:', req.body.content);
-        console.log('🔍 [DEBUG] Message details:', {
-          senderId: req.body.senderId,
-          content: req.body.content,
-          conversationId: req.body.conversationId
-        });
-        
-        try {
-          console.log('🚀 [WORKFLOW] Starting fixed workflow processing...');
-          const workflowResult = await workflowOrchestrator.processMessage(message as unknown as Message);
-          
-          console.log('✅ [WORKFLOW] Fixed workflow processing completed successfully');
-          console.log('📊 [WORKFLOW] Workflow state:', {
-            phase: workflowResult.phase,
-            collaborationRound: workflowResult.collaborationRound,
-            messagesCount: workflowResult.messages.length,
-            error: workflowResult.error
-          });
-          
-          // Save the workflow state
-          workflowOrchestrator.saveWorkflowState(workflowResult);
-          
-          // Return the complete workflow state
-          res.json({
-            message,
-            workflowMessages: workflowResult.messages,
-            workflowState: workflowResult,
-            messageCount: workflowResult.messages.length,
-            phase: workflowResult.phase,
-            sharedKnowledge: workflowResult.sharedKnowledge
-          });
-        } catch (workflowError) {
-          console.error('❌ [WORKFLOW] Workflow processing error:', workflowError);
-          console.log('🔄 [FALLBACK] Falling back to AgentOrchestrator...');
-          
-          // Fallback to old agent orchestrator if workflow fails
-          agentOrchestrator.processMessage(message, req.body.conversationId).catch(err => {
-            console.error('❌ [FALLBACK] Error processing message with fallback:', err);
-          });
-          
-          res.json(message);
-        }
-    } else {
-      res.json(message);
-    }
+    // Skip workflow processing for REST API calls - let Socket.IO handle it
+    // This prevents double processing when frontend uses both REST API and Socket.IO
+    console.log('📝 [REST] Message created via REST API, skipping workflow processing');
+    console.log('💡 [REST] Use Socket.IO for real-time workflow processing');
+    
+    res.json(message);
   } catch (error: any) {
     console.error('Error creating message:', error);
     res.status(500).json({ error: error.message });
@@ -559,9 +518,11 @@ io.on('connection', (socket) => {
           console.log('🔄 [FALLBACK] Falling back to AgentOrchestrator...');
           
           // Fallback to old agent orchestrator if workflow fails
-          agentOrchestrator.processMessage(message, data.conversationId).catch(err => {
-            console.error('❌ [FALLBACK] Error processing message with fallback:', err);
-          });
+          try {
+            await agentOrchestrator.processMessage(message, data.conversationId);
+          } catch (fallbackError) {
+            console.error('❌ [FALLBACK] Error processing message with fallback:', fallbackError);
+          }
         }
       }
     } catch (error) {

@@ -1,5 +1,4 @@
 import { useCallback } from 'react';
-import { Message, Agent, OllamaStatus } from '../../shared/types';
 import { apiService } from '../utils/api';
 
 export const useMessageManagement = () => {
@@ -7,51 +6,42 @@ export const useMessageManagement = () => {
     inputValue: string,
     activeAgent: string | null,
     activeConversation: string | null,
-    agents: Agent[],
-    ollamaStatus: OllamaStatus,
-    messages: Message[],
-    conversationMemory: any,
     setInputValue: (value: string) => void,
     setIsProcessing: (processing: boolean) => void,
-    setError: (error: string) => void
+    setError: (error: string) => void,
+    socket?: any
   ) => {
     if (inputValue.trim() && activeAgent && activeConversation) {
       setIsProcessing(true);
       
       try {
-        // Send user message
-        await apiService.sendMessage({
-          conversationId: activeConversation,
-          senderId: 'user-agent',
-          content: inputValue,
-          type: 'text'
-        });
-        
-        const userInput = inputValue;
-        setInputValue('');
-
-        // Process with Ollama through the active agent
-        const agent = agents.find(a => a.id === activeAgent);
-        if (agent && ollamaStatus.available && agent.id !== 'system-agent' && agent.id !== 'user-agent') {
-          // Get agent response
-          const response = await apiService.processWithOllama(
-            userInput,
-            agent.config?.model || 'llama2',
-            {
-              systemPrompt: agent.config?.systemPrompt,
-              conversationHistory: messages.slice(-10), // Last 10 messages for context
-              memory: conversationMemory
-            }
-          );
-
-          // Send agent response
-          await apiService.sendMessage({
+        if (socket) {
+          // Send user message via Socket.IO for real-time workflow processing
+          socket.emit('message', {
             conversationId: activeConversation,
-            senderId: activeAgent,
-            content: response.response || response.text || 'I understand. Let me help you with that.',
+            senderId: 'user-agent',
+            content: inputValue,
             type: 'text'
           });
+          
+          console.log('📤 [SOCKET] Message sent via Socket.IO for workflow processing');
+        } else {
+          // Fallback to REST API if socket not available
+          await apiService.sendMessage({
+            conversationId: activeConversation,
+            senderId: 'user-agent',
+            content: inputValue,
+            type: 'text'
+          });
+          
+          console.log('📤 [REST] Message sent via REST API (fallback)');
         }
+        
+        setInputValue('');
+
+        // Note: Agent responses are now handled by the WorkflowOrchestrator via Socket.IO
+        // No need to manually process with individual agents
+        
       } catch (err) {
         console.error('Error sending message:', err);
         setError('Failed to send message');

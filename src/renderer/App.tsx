@@ -26,6 +26,8 @@ import AgentModal from './components/AgentModal';
 import LoadingOverlay from './components/LoadingOverlay';
 import ErrorToast from './components/ErrorToast';
 import { WorkflowBuilder } from './components/WorkflowBuilder';
+import StopRulesHeader from './components/StopRulesHeader';
+import ToolCallCard, { ToolCall } from './components/ToolCallCard';
 
 //
 
@@ -79,24 +81,62 @@ export default function App() {
   // Workflow builder state
   const [showWorkflowBuilder, setShowWorkflowBuilder] = useState(false);
 
+  // Group chat interaction state
+  const [stopRules, setStopRules] = useState({
+    turns: { current: 0, max: 20 },
+    tools: { used: 0, max: 12 },
+    acceptance: { current: 0, required: 4 }
+  });
+  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
+  const [showStopRules, setShowStopRules] = useState(false);
+
+  // Tool call handlers
+  const handleToolCallApprove = (toolCallId: string) => {
+    setToolCalls(prev => prev.map(tc => 
+      tc.id === toolCallId 
+        ? { ...tc, status: 'completed' as const }
+        : tc
+    ));
+    setStopRules(prev => ({
+      ...prev,
+      acceptance: { ...prev.acceptance, current: prev.acceptance.current + 1 }
+    }));
+  };
+
+  const handleToolCallReject = (toolCallId: string) => {
+    setToolCalls(prev => prev.map(tc => 
+      tc.id === toolCallId 
+        ? { ...tc, status: 'failed' as const }
+        : tc
+    ));
+  };
+
+  const handleToolCallRetry = (toolCallId: string) => {
+    setToolCalls(prev => prev.map(tc => 
+      tc.id === toolCallId 
+        ? { ...tc, status: 'pending' as const }
+        : tc
+    ));
+  };
+
   // Memoized callbacks for Socket.IO connection
   const handleNewMessageCallback = useCallback((message: any) => {
     handleNewMessage(message, addMessage, setMessages);
   }, [handleNewMessage, addMessage, setMessages]);
 
   const handleTypingIndicator = useCallback((data: any) => {
-    setTypingAgents(prev => ({
-      ...prev,
-      [data.agentId]: data.isTyping
-    }));
+      setTypingAgents(prev => ({
+        ...prev,
+        [data.agentId]: data.isTyping
+      }));
   }, [setTypingAgents]);
 
   const handleAgentStatusUpdate = useCallback((data: any) => {
-    setAgents(prev => prev.map(agent => 
-      agent.id === data.agentId 
-        ? { ...agent, status: data.status as any }
-        : agent
-    ));
+      setAgents(prev => prev.map(agent => 
+        agent.id === data.agentId 
+          ? { ...agent, status: data.status as any }
+          : agent
+      ));
   }, [setAgents]);
 
   const handleAgentSync = useCallback(() => {
@@ -104,11 +144,11 @@ export default function App() {
   }, [syncAgentsWithBackend, setAgents]);
 
   const handleMemoryUpdateCallback = useCallback((data: any) => {
-    if (data.scope === 'conversation' && data.scopeId === activeConversation) {
-      setConversationMemory(data.memory);
-    } else if (data.scope === 'project') {
-      setProjectMemory(data.memory);
-    }
+      if (data.scope === 'conversation' && data.scopeId === activeConversation) {
+        setConversationMemory(data.memory);
+      } else if (data.scope === 'project') {
+        setProjectMemory(data.memory);
+      }
   }, [activeConversation, setConversationMemory, setProjectMemory]);
 
   const handleError = useCallback((error: string) => {
@@ -223,6 +263,95 @@ export default function App() {
           onOpenWorkflowBuilder={() => setShowWorkflowBuilder(true)}
         />
 
+        {/* Stop Rules Header */}
+        <StopRulesHeader
+          turns={stopRules.turns}
+          tools={stopRules.tools}
+          acceptance={stopRules.acceptance}
+          isVisible={showStopRules}
+        />
+
+        {/* Demo Controls */}
+            <div style={{
+          padding: '8px 16px',
+          borderBottom: `1px solid ${theme.colors.border}`,
+          backgroundColor: theme.colors.backgroundTertiary,
+              display: 'flex',
+          gap: '8px',
+          alignItems: 'center'
+        }}>
+                    <button
+            onClick={() => setShowStopRules(!showStopRules)}
+                      style={{
+              padding: '4px 8px',
+              backgroundColor: showStopRules ? theme.colors.primary : theme.colors.backgroundSecondary,
+              color: showStopRules ? 'white' : theme.colors.text,
+              border: 'none',
+              borderRadius: '4px',
+              fontSize: '11px',
+              cursor: 'pointer'
+            }}
+          >
+            {showStopRules ? 'Hide' : 'Show'} Stop Rules
+                    </button>
+          
+            <button 
+            onClick={() => {
+              setToolCalls([
+                {
+                  id: '1',
+                  name: 'Deploy to Production',
+                  description: 'Deploy the current build to production environment',
+                  status: 'requires_approval',
+                  approvalReason: 'This action will deploy to production. Please review the changes before approving.'
+                },
+                {
+                  id: '2',
+                  name: 'Database Migration',
+                  description: 'Run pending database migrations',
+                  status: 'pending'
+                },
+                {
+                  id: '3',
+                  name: 'API Test',
+                  description: 'Run automated API tests',
+                  status: 'running'
+                },
+                {
+                  id: '4',
+                  name: 'File Upload',
+                  description: 'Upload configuration files',
+                  status: 'completed',
+                  result: { files: ['config.json', 'env.prod'], uploaded: true }
+                },
+                {
+                  id: '5',
+                  name: 'Backup Database',
+                  description: 'Create database backup',
+                  status: 'failed',
+                  error: 'Insufficient disk space for backup'
+                }
+              ]);
+              setStopRules(prev => ({
+                ...prev,
+                turns: { ...prev.turns, current: 9 },
+                tools: { ...prev.tools, used: 7 }
+              }));
+            }}
+            style={{
+              padding: '4px 8px',
+              backgroundColor: theme.colors.backgroundSecondary,
+              color: theme.colors.text,
+              border: 'none',
+              borderRadius: '4px',
+              fontSize: '11px',
+              cursor: 'pointer'
+            }}
+          >
+            Demo Tool Calls
+            </button>
+        </div>
+
         <MessageList
           messages={messages}
           agents={agents}
@@ -239,13 +368,59 @@ export default function App() {
           messagesEndRef={messagesEndRef}
         />
 
+        {/* Demo Tool Calls Section */}
+        {toolCalls.length > 0 && (
+        <div style={{
+            padding: '16px',
+            borderTop: `1px solid ${theme.colors.border}`,
+            backgroundColor: theme.colors.backgroundSecondary
+          }}>
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '12px'
+            }}>
+              <h3 style={{ 
+                color: theme.colors.text, 
+                margin: 0, 
+                fontSize: '14px',
+                fontWeight: 600
+              }}>
+                Tool Calls ({toolCalls.length})
+              </h3>
+              <button
+                onClick={() => setToolCalls([])}
+                  style={{
+                  background: 'none',
+                  border: 'none',
+                  color: theme.colors.textMuted,
+                  cursor: 'pointer',
+                  fontSize: '12px'
+                }}
+              >
+                Clear All
+              </button>
+              </div>
+            {toolCalls.map(toolCall => (
+              <ToolCallCard
+                key={toolCall.id}
+                toolCall={toolCall}
+                onApprove={handleToolCallApprove}
+                onReject={handleToolCallReject}
+                onRetry={handleToolCallRetry}
+              />
+            ))}
+              </div>
+        )}
+
         <MessageInput
           inputValue={inputValue}
           isProcessing={isProcessing}
-          activeAgent={activeAgent}
           activeConversation={activeConversation}
+          agents={agents}
           onInputChange={setInputValue}
-          onSendMessage={() => handleSendMessage(inputValue, activeAgent, activeConversation, agents, ollamaStatus, messages, conversationMemory, setInputValue, setIsProcessing, setError)}
+          onSendMessage={() => handleSendMessage(inputValue, activeAgent, activeConversation, setInputValue, setIsProcessing, setError, socket)}
         />
 
         <StatusBar
@@ -254,7 +429,7 @@ export default function App() {
           agents={agents}
           messages={messages}
               />
-            </div>
+              </div>
 
       <MemoryPanel
         visible={memoryVisible}
