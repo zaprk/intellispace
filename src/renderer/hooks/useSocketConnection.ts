@@ -3,24 +3,25 @@ import { io, Socket } from 'socket.io-client';
 import { Message } from '../../shared/types';
 
 interface UseSocketConnectionProps {
-  activeConversation: string | null;
-  onNewMessage: (message: Message) => void;
-  onTypingIndicator: (data: { conversationId: string; agentId: string; isTyping: boolean }) => void;
-  onAgentStatusUpdate: (data: { agentId: string; status: string }) => void;
-  onAgentSync: () => void;
-  onMemoryUpdate: (data: { scope: string; scopeId: string; memory: any }) => void;
-  onError: (error: string) => void;
+  activeConversation?: string | null;
+  onNewMessage?: (message: Message) => void;
+  onTypingIndicator?: (data: { conversationId: string; agentId: string; isTyping: boolean }) => void;
+  onAgentStatusUpdate?: (data: { agentId: string; status: string }) => void;
+  onAgentSync?: () => void;
+  onMemoryUpdate?: (data: { scope: string; scopeId: string; memory: any }) => void;
+  onError?: (error: string) => void;
 }
 
-export const useSocketConnection = ({
-  activeConversation,
-  onNewMessage,
-  onTypingIndicator,
-  onAgentStatusUpdate,
-  onAgentSync,
-  onMemoryUpdate,
-  onError
-}: UseSocketConnectionProps) => {
+export const useSocketConnection = (props?: UseSocketConnectionProps) => {
+  const {
+    activeConversation = null,
+    onNewMessage = () => {},
+    onTypingIndicator = () => {},
+    onAgentStatusUpdate = () => {},
+    onAgentSync = () => {},
+    onMemoryUpdate = () => {},
+    onError = () => {}
+  } = props || {};
   const socketRef = useRef<Socket | null>(null);
 
   // Initialize Socket.IO connection

@@ -106,6 +106,47 @@ export class ConversationService {
     }
   }
 
+  // Ensure default conversation exists
+  private async ensureDefaultConversation() {
+    try {
+      // Check if default conversation exists
+      const defaultConversation = await this.prisma.conversation.findFirst({
+        where: { name: 'general' }
+      });
+
+      if (!defaultConversation) {
+        // Get or create default project
+        let defaultProject = await this.prisma.project.findUnique({
+          where: { id: 'default' }
+        });
+
+        if (!defaultProject) {
+          defaultProject = await this.prisma.project.create({
+            data: {
+              id: 'default',
+              name: 'Default Project',
+              description: 'Default project for general conversations'
+            }
+          });
+        }
+
+        // Create default conversation
+        await this.prisma.conversation.create({
+          data: {
+            id: 'general-conversation',
+            projectId: defaultProject.id,
+            name: 'general',
+            type: 'group',
+            participants: JSON.stringify([this.userAgentId, this.systemAgentId]),
+          }
+        });
+        console.log('✅ Created default conversation');
+      }
+    } catch (error) {
+      console.error('Error ensuring default conversation:', error);
+    }
+  }
+
   // Conversation Management
   async createConversation(data: CreateConversationDto) {
     try {
@@ -262,6 +303,37 @@ export class ConversationService {
   // Message Management (UPDATED)
   async createMessage(data: CreateMessageDto): Promise<MessageWithAgent> {
     try {
+      console.log('🔍 [ConversationService] Creating message with data:', {
+        conversationId: data.conversationId,
+        senderId: data.senderId,
+        content: data.content?.substring(0, 50) + '...',
+        type: data.type
+      });
+
+      // Ensure system agents and default conversation exist
+      await this.ensureSystemAgents();
+      await this.ensureDefaultConversation();
+
+      // Map conversation ID from frontend channel names to actual conversation IDs
+      let actualConversationId = data.conversationId;
+      
+      // The frontend now sends 'general-conversation' directly, so we don't need to map 'general'
+      // But we still need to ensure the conversation exists
+      if (data.conversationId === 'general-conversation') {
+        const defaultConversation = await this.prisma.conversation.findFirst({
+          where: { name: 'general' }
+        });
+        if (defaultConversation) {
+          actualConversationId = defaultConversation.id;
+          console.log('🔍 [ConversationService] Mapped general-conversation to actual ID:', actualConversationId);
+        }
+      }
+
+      console.log('🔍 [ConversationService] Mapped conversationId:', {
+        original: data.conversationId,
+        mapped: actualConversationId
+      });
+
       // Map special senderIds to agent IDs
       let actualSenderId = data.senderId;
       if (data.senderId === 'system') {
@@ -270,9 +342,41 @@ export class ConversationService {
         actualSenderId = this.userAgentId;
       }
 
+      console.log('🔍 [ConversationService] Mapped senderId:', {
+        original: data.senderId,
+        mapped: actualSenderId,
+        systemAgentId: this.systemAgentId,
+        userAgentId: this.userAgentId
+      });
+
+      // Validate that we have a valid sender ID
+      if (!actualSenderId) {
+        console.error('❌ [ConversationService] Invalid sender ID:', {
+          originalSenderId: data.senderId,
+          actualSenderId,
+          systemAgentId: this.systemAgentId,
+          userAgentId: this.userAgentId
+        });
+        throw new Error('Invalid sender ID: senderId is undefined');
+      }
+
+      // Validate that we have a valid conversation ID
+      if (!actualConversationId) {
+        console.error('❌ [ConversationService] Invalid conversation ID:', {
+          originalConversationId: data.conversationId,
+          actualConversationId
+        });
+        throw new Error('Invalid conversation ID: conversationId is undefined');
+      }
+
       // First, verify the sender exists
       const senderExists = await this.prisma.agent.findUnique({
         where: { id: actualSenderId }
+      });
+
+      console.log('🔍 [ConversationService] Sender exists check:', {
+        actualSenderId,
+        exists: !!senderExists
       });
 
       if (!senderExists) {
@@ -297,13 +401,60 @@ export class ConversationService {
               isActive: true
             }
           });
+        } else {
+          // If it's a system or user agent that doesn't exist, create it
+          const agentData = actualSenderId === this.systemAgentId ? {
+            id: this.systemAgentId,
+            name: 'System',
+            role: 'system',
+            avatar: '⚙️',
+            description: 'System notifications and messages'
+          } : {
+            id: this.userAgentId,
+            name: 'User',
+            role: 'user',
+            avatar: '👤',
+            description: 'Human user'
+          };
+
+          console.log('🔍 [ConversationService] Creating system/user agent:', agentData);
+
+          await this.prisma.agent.create({
+            data: {
+              ...agentData,
+              config: JSON.stringify({
+                llmProvider: 'none',
+                model: 'none',
+                temperature: 0,
+                maxTokens: 0,
+                systemPrompt: ''
+              }),
+              capabilities: JSON.stringify([]),
+              isActive: true
+            }
+          });
         }
+      }
+
+      // Verify the conversation exists
+      const conversationExists = await this.prisma.conversation.findUnique({
+        where: { id: actualConversationId }
+      });
+
+      console.log('🔍 [ConversationService] Conversation exists check:', {
+        actualConversationId,
+        exists: !!conversationExists
+      });
+
+      if (!conversationExists) {
+        console.error('❌ [ConversationService] Conversation not found:', actualConversationId);
+        throw new Error(`Conversation ${actualConversationId} not found`);
       }
 
       const message = await this.prisma.message.create({
         data: {
           id: uuidv4(),
-          conversationId: data.conversationId,
+          conversationId: actualConversationId,
           senderId: actualSenderId,
           content: data.content,
           type: data.type,
@@ -316,7 +467,7 @@ export class ConversationService {
 
       // Update conversation's updatedAt
       await this.prisma.conversation.update({
-        where: { id: data.conversationId },
+        where: { id: actualConversationId },
         data: { updatedAt: new Date() },
       });
 
@@ -331,18 +482,27 @@ export class ConversationService {
         },
       };
 
+      console.log('✅ [ConversationService] Message created successfully:', {
+        messageId: formattedMessage.id,
+        senderId: formattedMessage.senderId,
+        senderName: formattedMessage.sender.name,
+        conversationId: formattedMessage.conversationId
+      });
+
       // Broadcast to all clients in the conversation
-      this.io.to(`conversation:${data.conversationId}`).emit('new-message', formattedMessage);
+      this.io.to(`conversation:${actualConversationId}`).emit('new-message', formattedMessage);
 
       return formattedMessage;
     } catch (error) {
-      console.error('Error creating message:', error);
+      console.error('❌ [ConversationService] Error creating message:', error);
       throw error;
     }
   }
 
   async getMessages(conversationId: string, limit: number = 50, offset: number = 0) {
     try {
+      console.log('🔍 [ConversationService] Getting messages for conversation:', conversationId);
+      
       const messages = await this.prisma.message.findMany({
         where: { conversationId },
         include: {
@@ -355,12 +515,14 @@ export class ConversationService {
         skip: offset,
       });
 
+      console.log('📨 [ConversationService] Found', messages.length, 'messages for conversation:', conversationId);
+
       return messages.reverse().map(msg => ({
         ...msg,
         metadata: msg.metadata ? JSON.parse(msg.metadata) : null,
       }));
     } catch (error) {
-      console.error('Error getting messages:', error);
+      console.error('❌ [ConversationService] Error getting messages:', error);
       throw error;
     }
   }

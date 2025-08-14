@@ -4,6 +4,9 @@ export interface Agent {
   role: string;
   description: string;
   status: 'online' | 'busy' | 'offline';
+  avatar?: string;
+  isActive?: boolean;
+  capabilities?: string[];
   config: {
     llmProvider: string;
     model: string;
@@ -35,6 +38,37 @@ export interface Message {
     avatar: string;
     role: string;
   };
+  agent?: {
+    id: string;
+    name: string;
+    avatar: string;
+    role: string;
+  };
+}
+
+// New workflow-related types
+export interface WorkflowMode {
+  type: 'solo' | 'mini-workflow' | 'full-workflow';
+  agents: string[];
+  maxRounds: number;
+  reason: string;
+}
+
+export interface ProcessingStrategy {
+  type: 'direct-mention' | 'mini-collaboration' | 'team-workflow' | 'collaborative-flow' | 'continue-flow' | 'no-processing';
+  targetAgents: string[];
+  maxResponses: number;
+  timeout: number;
+  reason: string;
+}
+
+export interface ConversationStatus {
+  conversationId: string;
+  hasActiveMode: boolean;
+  currentMode?: string;
+  isLocked: boolean;
+  lastActivity?: number;
+  canReset: boolean;
 }
 
 export interface OllamaStatus {

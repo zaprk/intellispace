@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { ConversationService } from '../services/ConversationService';
 
-export default function conversationRoutes(prisma: PrismaClient, conversationService: ConversationService) {
+export default function conversationRoutes(prisma: PrismaClient, conversationService: ConversationService, workflowOrchestrator?: any) {
   const router = Router();
 
   // Get all conversations
@@ -148,6 +148,54 @@ export default function conversationRoutes(prisma: PrismaClient, conversationSer
     } catch (error) {
       console.error('Error exporting conversation:', error);
       res.status(500).json({ error: 'Failed to export conversation' });
+    }
+  });
+
+  // Reset conversation workflow state
+  router.post('/:id/reset', async (req, res) => {
+    try {
+      if (!workflowOrchestrator) {
+        return res.status(500).json({ error: 'Workflow orchestrator not available' });
+      }
+      
+      const { id } = req.params;
+      workflowOrchestrator.forceResetConversation(id);
+      res.json({ success: true, message: 'Conversation reset' });
+    } catch (error) {
+      console.error('Error resetting conversation:', error);
+      res.status(500).json({ error: 'Failed to reset conversation' });
+    }
+  });
+
+  // Get conversation status
+  router.get('/:id/status', async (req, res) => {
+    try {
+      if (!workflowOrchestrator) {
+        return res.status(500).json({ error: 'Workflow orchestrator not available' });
+      }
+      
+      const { id } = req.params;
+      const status = workflowOrchestrator.getConversationStatus(id);
+      res.json(status);
+    } catch (error) {
+      console.error('Error getting conversation status:', error);
+      res.status(500).json({ error: 'Failed to get conversation status' });
+    }
+  });
+
+  // Check if conversation is stuck
+  router.get('/:id/stuck', async (req, res) => {
+    try {
+      if (!workflowOrchestrator) {
+        return res.status(500).json({ error: 'Workflow orchestrator not available' });
+      }
+      
+      const { id } = req.params;
+      const isStuck = workflowOrchestrator.isConversationStuck(id);
+      res.json({ conversationId: id, isStuck });
+    } catch (error) {
+      console.error('Error checking conversation status:', error);
+      res.status(500).json({ error: 'Failed to check conversation status' });
     }
   });
 

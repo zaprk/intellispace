@@ -11,7 +11,6 @@ dotenv.config();
 
 // Import all services - these should be in separate files in src/backend/services/
 import { ConversationService } from './services/ConversationService';
-import { AgentOrchestrator } from './services/AgentOrchestrator';
 import { LLMService } from './services/LLMService';
 import { MemoryService } from './services/MemoryService';
 import { WorkflowOrchestrator } from './services/WorkflowOrchestrator';
@@ -33,32 +32,12 @@ const PORT = process.env.PORT || 3001;
 const llmService = new LLMService();
 const memoryService = new MemoryService(prisma);
 const conversationService = new ConversationService(prisma, io);
-const agentOrchestrator = new AgentOrchestrator(
-  llmService,
-  conversationService,
-  memoryService,
-  io
-);
-// Initialize workflow orchestrator
+
+// Initialize unified workflow orchestrator (replaces AgentOrchestrator)
 const workflowOrchestrator = new WorkflowOrchestrator(prisma);
 
 // Set up Socket.IO for streaming
 workflowOrchestrator.setSocketIO(io);
-
-// Update workflow with actual agent IDs after agents are loaded
-const updateWorkflowAgents = () => {
-  workflowOrchestrator.updateTeamAgents(agentOrchestrator);
-};
-
-// Update workflow agents initially
-updateWorkflowAgents();
-
-// Update workflow agents whenever agents are reloaded
-const originalLoadAgents = agentOrchestrator.loadAgents.bind(agentOrchestrator);
-agentOrchestrator.loadAgents = async () => {
-  await originalLoadAgents();
-  updateWorkflowAgents();
-};
 
 // Middleware
 app.use(cors({
@@ -83,7 +62,7 @@ app.get('/health', (req, res) => {
 // ===== Agent Routes =====
 app.get('/api/agents', async (req, res) => {
   try {
-    const agents = agentOrchestrator.getAllAgents();
+    const agents = workflowOrchestrator.getAllAgents();
     res.json(agents);
   } catch (error: any) {
     console.error('Error fetching agents:', error);
@@ -93,7 +72,7 @@ app.get('/api/agents', async (req, res) => {
 
 app.post('/api/agents', async (req, res) => {
   try {
-    const agent = await agentOrchestrator.createAgent(req.body);
+    const agent = await workflowOrchestrator.createAgent(req.body);
     res.json(agent);
   } catch (error: any) {
     console.error('Error creating agent:', error);
@@ -103,7 +82,7 @@ app.post('/api/agents', async (req, res) => {
 
 app.put('/api/agents/:id', async (req, res) => {
   try {
-    const agent = await agentOrchestrator.updateAgent(req.params.id, req.body);
+    const agent = await workflowOrchestrator.updateAgent(req.params.id, req.body);
     res.json(agent);
   } catch (error: any) {
     console.error('Error updating agent:', error);
@@ -113,7 +92,7 @@ app.put('/api/agents/:id', async (req, res) => {
 
 app.delete('/api/agents/:id', async (req, res) => {
   try {
-    await agentOrchestrator.deleteAgent(req.params.id);
+    await workflowOrchestrator.deleteAgent(req.params.id);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error deleting agent:', error);
@@ -123,7 +102,7 @@ app.delete('/api/agents/:id', async (req, res) => {
 
 app.post('/api/agents/reload', async (req, res) => {
   try {
-    await agentOrchestrator.loadAgents();
+    await workflowOrchestrator.loadAgents();
     res.json({ success: true, message: 'Agents reloaded successfully' });
   } catch (error: any) {
     console.error('Error reloading agents:', error);
@@ -132,6 +111,8 @@ app.post('/api/agents/reload', async (req, res) => {
 });
 
 // ===== Conversation Routes =====
+// Note: We'll need to update the conversation routes to use workflowOrchestrator
+// For now, we'll use the conversation service directly
 app.get('/api/conversations', async (req, res) => {
   try {
     const conversations = await conversationService.getConversations(req.query.projectId as string);
@@ -399,7 +380,7 @@ app.get('/api/llm/:provider/models', async (req, res) => {
 // ===== Tools Routes =====
 app.get('/api/tools', (req, res) => {
   try {
-    const tools = agentOrchestrator.getAvailableTools();
+    const tools = workflowOrchestrator.getAvailableTools();
     res.json(tools.map(t => ({
       id: t.id,
       name: t.name,
@@ -415,7 +396,7 @@ app.post('/api/tools/:toolId/execute', async (req, res) => {
   try {
     const { toolId } = req.params;
     const { params, agentId } = req.body;
-    const result = await agentOrchestrator.executeTool(toolId, params, agentId);
+    const result = await workflowOrchestrator.executeTool(toolId, params, agentId);
     res.json(result);
   } catch (error: any) {
     console.error('Error executing tool:', error);
@@ -440,7 +421,7 @@ app.post('/api/agents/:agentId/trigger', async (req, res) => {
       timestamp: new Date().toISOString()
     };
     
-    agentOrchestrator.processMessage(mockMessage, conversationId).catch(err => {
+    workflowOrchestrator.processMessage(mockMessage as Message).catch(err => {
       console.error('Error triggering agent:', err);
     });
     
@@ -477,6 +458,16 @@ io.on('connection', (socket) => {
     );
   });
 
+  socket.on('join', (data) => {
+    try {
+      console.log('🔗 Client joining conversation:', data.conversationId);
+      socket.join(`conversation:${data.conversationId}`);
+      console.log('✅ Client joined conversation room:', data.conversationId);
+    } catch (error) {
+      console.error('❌ Error joining conversation:', error);
+    }
+  });
+
   socket.on('message', async (data) => {
     try {
       // Create message through conversation service
@@ -509,20 +500,16 @@ io.on('connection', (socket) => {
           // Broadcast all the messages from the workflow result
           for (const workflowMessage of workflowResult.messages) {
             console.log(`📤 [WORKFLOW] Broadcasting message from ${workflowMessage.senderId}: ${workflowMessage.content.substring(0, 100)}...`);
-            io.to(`conversation:${data.conversationId}`).emit('new-message', workflowMessage);
+            io.to(`conversation:${workflowMessage.conversationId || data.conversationId}`).emit('new-message', workflowMessage);
           }
           
           console.log(`✅ [WORKFLOW] All ${workflowResult.messages.length} workflow messages broadcasted`);
         } catch (workflowError) {
           console.error('❌ [WORKFLOW] Workflow processing error:', workflowError);
-          console.log('🔄 [FALLBACK] Falling back to AgentOrchestrator...');
+          console.log('🔄 [FALLBACK] No fallback available - workflow processing failed');
           
-          // Fallback to old agent orchestrator if workflow fails
-          try {
-            await agentOrchestrator.processMessage(message, data.conversationId);
-          } catch (fallbackError) {
-            console.error('❌ [FALLBACK] Error processing message with fallback:', fallbackError);
-          }
+          // No fallback needed since we're using unified orchestrator
+          console.error('❌ [FALLBACK] Workflow processing failed completely:', workflowError);
         }
       }
     } catch (error) {
@@ -584,10 +571,91 @@ async function startServer() {
     // Load agents
     console.log('🔍 Loading agents...');
     try {
-      await agentOrchestrator.loadAgents();
+      await workflowOrchestrator.loadAgents();
       console.log('✅ Agents loaded successfully');
     } catch (error) {
       console.warn('⚠️ Could not load agents:', error.message);
+    }
+
+    // Create default agents if they don't exist
+    console.log('🔍 Creating default agents...');
+    try {
+      const defaultAgents = [
+        {
+          id: 'coordinator-agent',
+          name: 'Project Coordinator',
+          role: 'coordinator',
+          avatar: '🎯',
+          description: 'Coordinates team collaboration and project management',
+          config: JSON.stringify({
+            llmProvider: 'ollama',
+            model: 'llama3',
+            temperature: 0.7,
+            maxTokens: 4000,
+            systemPrompt: 'You are a project coordinator. Help organize tasks, coordinate team members, and ensure project success.'
+          }),
+          capabilities: JSON.stringify(['task-management', 'team-coordination', 'project-planning'])
+        },
+        {
+          id: 'designer-agent',
+          name: 'UI/UX Designer',
+          role: 'designer',
+          avatar: '🎨',
+          description: 'Creates beautiful and functional user interfaces',
+          config: JSON.stringify({
+            llmProvider: 'ollama',
+            model: 'llama3',
+            temperature: 0.8,
+            maxTokens: 4000,
+            systemPrompt: 'You are a UI/UX designer. Create beautiful, user-friendly designs and provide design guidance.'
+          }),
+          capabilities: JSON.stringify(['ui-design', 'ux-design', 'prototyping', 'design-systems'])
+        },
+        {
+          id: 'frontend-agent',
+          name: 'Frontend Developer',
+          role: 'frontend-developer',
+          avatar: '⚛️',
+          description: 'Builds responsive and interactive frontend applications',
+          config: JSON.stringify({
+            llmProvider: 'ollama',
+            model: 'llama3',
+            temperature: 0.6,
+            maxTokens: 4000,
+            systemPrompt: 'You are a frontend developer. Write clean, efficient code for web applications using modern frameworks.'
+          }),
+          capabilities: JSON.stringify(['react', 'typescript', 'javascript', 'html', 'css'])
+        },
+        {
+          id: 'backend-agent',
+          name: 'Backend Developer',
+          role: 'backend-developer',
+          avatar: '🔧',
+          description: 'Develops robust backend systems and APIs',
+          config: JSON.stringify({
+            llmProvider: 'ollama',
+            model: 'llama3',
+            temperature: 0.6,
+            maxTokens: 4000,
+            systemPrompt: 'You are a backend developer. Build scalable APIs, databases, and server-side applications.'
+          }),
+          capabilities: JSON.stringify(['nodejs', 'express', 'database', 'api-design', 'authentication'])
+        }
+      ];
+
+      for (const agentData of defaultAgents) {
+        await prisma.agent.upsert({
+          where: { id: agentData.id },
+          update: {},
+          create: {
+            ...agentData,
+            isActive: true
+          }
+        });
+      }
+      console.log('✅ Default agents created successfully');
+    } catch (error) {
+      console.warn('⚠️ Could not create default agents:', error.message);
     }
 
     // Start server
