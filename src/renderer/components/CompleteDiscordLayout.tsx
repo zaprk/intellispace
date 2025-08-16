@@ -15,6 +15,7 @@ import { useSocketConnection } from '../hooks/useSocketConnection';
 import { useConversationManagement } from '../hooks/useConversationManagement';
 import { useDataLoading } from '../hooks/useDataLoading';
 import { Message, Agent, Conversation } from '../../shared/types';
+import AddButton from './AddButton';
 
 const CompleteDiscordLayout = () => {
   // Add CSS animations
@@ -41,6 +42,7 @@ const CompleteDiscordLayout = () => {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [messagesByConversation, setMessagesByConversation] = useState<{ [key: string]: Message[] }>({});
   const [isLoading, setIsLoading] = useState(true);
 
   const { socket } = useSocketConnection();
@@ -78,16 +80,29 @@ const CompleteDiscordLayout = () => {
         const conversationId = getConversationId(activeChannel);
         console.log('🔄 Loading messages for channel:', activeChannel, '→ conversation:', conversationId);
         
+        // Check if we have cached messages for this conversation
+        if (messagesByConversation[conversationId]) {
+          console.log('📨 Using cached messages for conversation:', conversationId);
+          setMessages(messagesByConversation[conversationId]);
+          return;
+        }
+        
         try {
-                     await loadConversationMessages(
-             conversationId,
-             agents,
-             setMessages,
-             () => {}, // setConversationMemory
-             (error: string) => console.error('Error loading messages:', error)
-           );
-           
-           console.log('📨 Messages loaded for conversation:', conversationId);
+          await loadConversationMessages(
+            conversationId,
+            agents,
+            setMessages,
+            () => {}, // setConversationMemory
+            (error: string) => console.error('Error loading messages:', error)
+          );
+          
+          // Cache the messages after loading
+          setMessagesByConversation(prev => ({
+            ...prev,
+            [conversationId]: messages
+          }));
+          
+          console.log('📨 Messages loaded for conversation:', conversationId);
         } catch (error) {
           console.error('Error loading messages for', conversationId, ':', error);
           setMessages([]);
@@ -96,7 +111,7 @@ const CompleteDiscordLayout = () => {
     };
 
     loadMessages();
-  }, [activeChannel, agents, isLoading, loadConversationMessages]);
+  }, [activeChannel, agents, isLoading, loadConversationMessages, messagesByConversation]);
 
   // Join conversation room when channel changes
   useEffect(() => {
@@ -115,9 +130,23 @@ const CompleteDiscordLayout = () => {
         console.log('📨 Received new message from backend:', message);
         const currentConversationId = getConversationId(activeChannel);
         console.log('🔍 Checking if message belongs to current conversation:', message.conversationId, '===', currentConversationId);
+        console.log('🔍 Current active channel:', activeChannel);
+        console.log('🔍 Message senderId:', message.senderId);
+        console.log('🔍 Message content preview:', message.content?.substring(0, 100));
+        
+        // Skip user messages from backend (they're added locally)
+        if (message.senderId === 'user' || message.senderId === 'user-agent') {
+          console.log('⏭️ Skipping user message from backend (added locally)');
+          return;
+        }
         
         // Only add messages for the current channel
-        if (message.conversationId === currentConversationId) {
+        // Temporary fix: Also accept messages without conversationId for general channel
+        const shouldAcceptMessage = message.conversationId === currentConversationId || 
+                                   (currentConversationId === 'general-conversation' && (!message.conversationId || message.conversationId === 'general-conversation'));
+        
+        if (shouldAcceptMessage) {
+          const conversationId = getConversationId(activeChannel);
           setMessages((prev: Message[]) => {
             // Check if message already exists
             const exists = prev.some(m => m.id === message.id);
@@ -126,10 +155,19 @@ const CompleteDiscordLayout = () => {
               return prev;
             }
             console.log('✅ Adding new message to conversation:', message.id);
-            return [...prev, message];
+            const newMessages = [...prev, message];
+            
+            // Update the conversation cache
+            setMessagesByConversation(prevCache => ({
+              ...prevCache,
+              [conversationId]: newMessages
+            }));
+            
+            return newMessages;
           });
         } else {
           console.log('❌ Message not for current conversation, ignoring');
+          console.log('❌ Expected:', currentConversationId, 'Got:', message.conversationId);
         }
       };
 
@@ -152,18 +190,52 @@ const CompleteDiscordLayout = () => {
   // Create new conversation
   const handleCreateConversation = async () => {
     try {
-             await createNewConversation(
-         conversations,
-         agents,
-         setConversations,
-         setActiveChannel,
-         (error: string) => console.error('Error:', error)
-       );
-       
-       console.log('✅ New conversation creation initiated');
+      await createNewConversation(
+        conversations,
+        agents,
+        setConversations,
+        setActiveChannel,
+        (error: string) => console.error('Error:', error)
+      );
+      
+      console.log('✅ New conversation creation initiated');
     } catch (error) {
       console.error('Error creating conversation:', error);
     }
+  };
+
+  // Create team conversation with selected agents
+  const handleCreateTeamConversation = async (selectedAgentIds: string[]) => {
+    try {
+      const teamName = `Team ${conversations.length + 1}`;
+      const teamDescription = `Team with ${selectedAgentIds.length} agents`;
+      
+      const newConversation: Conversation = {
+        id: `team-${Date.now()}`,
+        name: teamName,
+        type: 'team',
+        projectId: 'default',
+        participants: selectedAgentIds
+      };
+
+      setConversations(prev => [...prev, newConversation]);
+      setActiveChannel(newConversation.id);
+      
+      console.log('✅ Team conversation created:', teamName);
+    } catch (error) {
+      console.error('Error creating team conversation:', error);
+    }
+  };
+
+  // Create direct message with an agent
+  const handleCreateDirectMessage = async (agentId: string) => {
+    const agent = agents.find(a => a.id === agentId);
+    if (!agent) return;
+
+    const dmChannelId = `dm-${agentId}`;
+    setActiveChannel(dmChannelId);
+    
+    console.log('✅ Direct message created with:', agent.name);
   };
 
   // Helper function to get the correct conversation ID
@@ -203,13 +275,25 @@ const CompleteDiscordLayout = () => {
       agent: { id: 'user', name: 'You', avatar: '👤', role: 'user' }
     };
 
-             setMessages((prev: Message[]) => [...prev, newMessage]);
+    setMessages((prev: Message[]) => {
+      console.log('📝 Adding user message to state. Previous count:', prev.length);
+      const newMessages = [...prev, newMessage];
+      console.log('📝 New message count:', newMessages.length);
+      
+      // Cache the messages for this conversation
+      setMessagesByConversation(prevCache => ({
+        ...prevCache,
+        [conversationId]: newMessages
+      }));
+      
+      return newMessages;
+    });
 
-    // Simulate agent responses based on mentions
+    // Extract mentions for logging (but don't simulate responses - let the real workflow handle it)
     const mentions = extractMentions(messageData.content);
-         if (mentions.length > 0) {
-       simulateAgentResponses(mentions);
-     }
+    if (mentions.length > 0) {
+      console.log('📝 Mentions detected:', mentions);
+    }
 
     if (socket) {
       // Use the correct conversation ID for the backend
@@ -239,62 +323,7 @@ const CompleteDiscordLayout = () => {
     }).filter(Boolean);
   };
 
-     // Simulate agent responses for demo
-   const simulateAgentResponses = (mentionedAgents: string[]) => {
-    const conversationId = getConversationId(activeChannel);
-    
-    mentionedAgents.forEach((agentId, index) => {
-      const agent = agents.find(a => a.id === agentId);
-      if (!agent) return;
 
-      // Show typing indicator
-      setTimeout(() => {
-                 setTypingAgents((prev: { [key: string]: boolean }) => ({ ...prev, [agentId]: true }));
-      }, (index + 1) * 1000);
-
-      // Send response
-      setTimeout(() => {
-        setTypingAgents(prev => ({ ...prev, [agentId]: false }));
-        
-        const responses: { [key: string]: string } = {
-          coordinator: 'I\'ll help coordinate this request. Let me break this down into actionable tasks for the team.',
-          designer: 'I can help with the visual design and user experience. Let me create some mockups for this.',
-          frontend: 'I\'ll handle the frontend implementation. What framework would you prefer for this project?',
-          backend: 'I can set up the backend infrastructure and APIs. Do you need user authentication or payment processing?'
-        };
-
-        const newMessage: Message = {
-          id: `msg-${Date.now()}-${agentId}`,
-          conversationId: conversationId,
-          senderId: agentId,
-          content: responses[agentId] || 'I\'m ready to help with this request!',
-          timestamp: new Date().toISOString(),
-          type: 'text',
-          agent: {
-         id: agent.id,
-         name: agent.name,
-         avatar: agent.avatar || '🤖',
-         role: agent.role
-       }
-        };
-
-        setMessages((prev: Message[]) => [...prev, newMessage]);
-      }, (index + 1) * 3000);
-    });
-
-    // Update workflow status
-    setWorkflowStatus({
-      conversationId: conversationId,
-      hasActiveMode: true,
-      currentMode: mentionedAgents.length === 1 ? 'solo' : 'mini-collaboration',
-      isLocked: false,
-      lastActivity: Date.now(),
-      canReset: true,
-      activeAgents: mentionedAgents,
-      completedRounds: 0,
-      maxRounds: mentionedAgents.length === 1 ? 1 : 2
-    });
-  };
 
   // Workflow controls
   const handleResetWorkflow = (conversationId: string) => {
@@ -305,7 +334,7 @@ const CompleteDiscordLayout = () => {
 
   const handlePauseWorkflow = (conversationId: string) => {
     console.log(`Pausing workflow for ${conversationId}`);
-    setWorkflowStatus(prev => prev ? { ...prev, hasActiveMode: false } : null);
+    setWorkflowStatus((prev: any) => prev ? { ...prev, hasActiveMode: false } : null);
   };
 
   // Format timestamp for display
@@ -400,31 +429,13 @@ const CompleteDiscordLayout = () => {
           <Hash size={20} style={{ color: 'white' }} />
         </div>
         
-        <div style={{
-          width: '48px',
-          height: '48px',
-          backgroundColor: '#4f545c',
-          borderRadius: '24px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          cursor: 'pointer',
-          transition: 'all 0.2s'
-        }}
-        onMouseEnter={(e) => {
-          const target = e.target as HTMLElement;
-          target.style.backgroundColor = '#3ba55c';
-          target.style.borderRadius = '12px';
-        }}
-        onMouseLeave={(e) => {
-          const target = e.target as HTMLElement;
-          target.style.backgroundColor = '#4f545c';
-          target.style.borderRadius = '24px';
-        }}
-        onClick={handleCreateConversation}
-        >
-          <Plus size={20} style={{ color: 'white' }} />
-        </div>
+                 <AddButton
+           onCreateAgent={() => {
+             console.log('Create agent functionality not implemented yet');
+           }}
+           onCreateConversation={handleCreateConversation}
+           collapsed={false}
+         />
       </div>
 
       {/* Channel List */}
@@ -756,7 +767,8 @@ const CompleteDiscordLayout = () => {
           flex: 1,
           overflowY: 'auto',
           padding: '16px',
-          backgroundColor: '#36393f'
+          backgroundColor: '#36393f',
+          width: '100vh'
         }}>
           {isLoading ? (
             <div style={{ 
@@ -1035,6 +1047,87 @@ const CompleteDiscordLayout = () => {
               </div>
             )}
 
+            {/* Team Creation */}
+            <div style={{
+              backgroundColor: '#292b2f',
+              border: '1px solid #40444b',
+              borderRadius: '8px',
+              padding: '16px'
+            }}>
+              <h3 style={{ fontWeight: '600', color: 'white', marginBottom: '12px' }}>Create Team</h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <button
+                  onClick={() => handleCreateTeamConversation(['coordinator-agent', 'designer-agent', 'frontend-agent', 'backend-agent'])}
+                  style={{
+                    backgroundColor: '#5865f2',
+                    color: 'white',
+                    padding: '8px 12px',
+                    borderRadius: '4px',
+                    fontSize: '12px',
+                    border: 'none',
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s'
+                  }}
+                  onMouseEnter={(e) => {
+                    const target = e.target as HTMLElement;
+                    target.style.backgroundColor = '#4752c4';
+                  }}
+                  onMouseLeave={(e) => {
+                    const target = e.target as HTMLElement;
+                    target.style.backgroundColor = '#5865f2';
+                  }}
+                >
+                  🚀 Create Web Team
+                </button>
+                <button
+                  onClick={() => handleCreateTeamConversation(['coordinator-agent', 'designer-agent'])}
+                  style={{
+                    backgroundColor: '#57f287',
+                    color: 'white',
+                    padding: '8px 12px',
+                    borderRadius: '4px',
+                    fontSize: '12px',
+                    border: 'none',
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s'
+                  }}
+                  onMouseEnter={(e) => {
+                    const target = e.target as HTMLElement;
+                    target.style.backgroundColor = '#3ba55c';
+                  }}
+                  onMouseLeave={(e) => {
+                    const target = e.target as HTMLElement;
+                    target.style.backgroundColor = '#57f287';
+                  }}
+                >
+                  🎨 Design Team
+                </button>
+                <button
+                  onClick={() => handleCreateTeamConversation(['coordinator-agent', 'frontend-agent', 'backend-agent'])}
+                  style={{
+                    backgroundColor: '#faa61a',
+                    color: 'white',
+                    padding: '8px 12px',
+                    borderRadius: '4px',
+                    fontSize: '12px',
+                    border: 'none',
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s'
+                  }}
+                  onMouseEnter={(e) => {
+                    const target = e.target as HTMLElement;
+                    target.style.backgroundColor = '#d68910';
+                  }}
+                  onMouseLeave={(e) => {
+                    const target = e.target as HTMLElement;
+                    target.style.backgroundColor = '#faa61a';
+                  }}
+                >
+                  ⚛️ Dev Team
+                </button>
+              </div>
+            </div>
+
             {/* Online Agents */}
             <div style={{
               backgroundColor: '#292b2f',
@@ -1054,35 +1147,60 @@ const CompleteDiscordLayout = () => {
                   </div>
                 ) : (
                   agents.filter(agent => agent.role !== 'user' && agent.role !== 'system').map(agent => (
-                    <div key={agent.id} style={{ display: 'flex', alignItems: 'center' }}>
-                      <div style={{ position: 'relative', marginRight: '12px' }}>
-                        <div style={{
-                          width: '32px',
-                          height: '32px',
-                          backgroundColor: '#40444b',
-                          borderRadius: '50%',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          fontSize: '18px'
-                        }}>
-                          {agent.avatar || '🤖'}
+                    <div key={agent.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <div style={{ position: 'relative', marginRight: '12px' }}>
+                          <div style={{
+                            width: '32px',
+                            height: '32px',
+                            backgroundColor: '#40444b',
+                            borderRadius: '50%',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '18px'
+                          }}>
+                            {agent.avatar || '🤖'}
+                          </div>
+                          <div style={{
+                            position: 'absolute',
+                            bottom: '-2px',
+                            right: '-2px',
+                            width: '12px',
+                            height: '12px',
+                            backgroundColor: '#3ba55c',
+                            borderRadius: '50%',
+                            border: '2px solid #292b2f'
+                          }}></div>
                         </div>
-                        <div style={{
-                          position: 'absolute',
-                          bottom: '-2px',
-                          right: '-2px',
-                          width: '12px',
-                          height: '12px',
-                          backgroundColor: '#3ba55c',
-                          borderRadius: '50%',
-                          border: '2px solid #292b2f'
-                        }}></div>
+                        <div>
+                          <div style={{ fontSize: '14px', fontWeight: '500', color: 'white' }}>{agent.name}</div>
+                          <div style={{ fontSize: '12px', color: '#96989d' }}>{agent.role.replace('-', ' ')}</div>
+                        </div>
                       </div>
-                      <div>
-                        <div style={{ fontSize: '14px', fontWeight: '500', color: 'white' }}>{agent.name}</div>
-                        <div style={{ fontSize: '12px', color: '#96989d' }}>{agent.role.replace('-', ' ')}</div>
-                      </div>
+                      <button
+                        onClick={() => handleCreateDirectMessage(agent.id)}
+                        style={{
+                          backgroundColor: '#5865f2',
+                          color: 'white',
+                          padding: '4px 8px',
+                          borderRadius: '4px',
+                          fontSize: '10px',
+                          border: 'none',
+                          cursor: 'pointer',
+                          transition: 'background-color 0.2s'
+                        }}
+                        onMouseEnter={(e) => {
+                          const target = e.target as HTMLElement;
+                          target.style.backgroundColor = '#4752c4';
+                        }}
+                        onMouseLeave={(e) => {
+                          const target = e.target as HTMLElement;
+                          target.style.backgroundColor = '#5865f2';
+                        }}
+                      >
+                        DM
+                      </button>
                     </div>
                   ))
                 )}

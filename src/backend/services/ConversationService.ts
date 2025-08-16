@@ -46,6 +46,59 @@ export class ConversationService {
   }
 
   // Initialize system and user agents
+  private async validateAndCreateAgent(agentId: string): Promise<boolean> {
+    try {
+      // Check if agent exists
+      const existingAgent = await this.prisma.agent.findUnique({
+        where: { id: agentId }
+      });
+
+      if (existingAgent) {
+        return true;
+      }
+
+      // Only create system/user agents automatically
+      if (agentId === this.systemAgentId || agentId === this.userAgentId) {
+        const agentData = agentId === this.systemAgentId ? {
+          id: this.systemAgentId,
+          name: 'System',
+          role: 'system',
+          avatar: '⚙️',
+          description: 'System notifications and messages'
+        } : {
+          id: this.userAgentId,
+          name: 'User',
+          role: 'user',
+          avatar: '👤',
+          description: 'Human user'
+        };
+
+        await this.prisma.agent.create({
+          data: {
+            ...agentData,
+            config: JSON.stringify({
+              llmProvider: 'none',
+              model: 'none',
+              temperature: 0,
+              maxTokens: 0,
+              systemPrompt: ''
+            }),
+            capabilities: JSON.stringify([]),
+            isActive: true
+          }
+        });
+        return true;
+      }
+
+      // For other agents, log error and return false
+      console.error(`❌ [ConversationService] Agent ${agentId} does not exist and cannot be auto-created`);
+      return false;
+    } catch (error) {
+      console.error('Error validating agent:', error);
+      return false;
+    }
+  }
+
   private async ensureSystemAgents() {
     try {
       // Check if system agent exists
@@ -310,6 +363,20 @@ export class ConversationService {
         type: data.type
       });
 
+      // Map special senderIds to agent IDs first
+      let actualSenderId = data.senderId;
+      if (data.senderId === 'system') {
+        actualSenderId = this.systemAgentId;
+      } else if (data.senderId === 'user') {
+        actualSenderId = this.userAgentId;
+      }
+
+      // Validate agent exists before creating message
+      const agentExists = await this.validateAndCreateAgent(actualSenderId);
+      if (!agentExists) {
+        throw new Error(`Agent ${actualSenderId} does not exist`);
+      }
+
       // Ensure system agents and default conversation exist
       await this.ensureSystemAgents();
       await this.ensureDefaultConversation();
@@ -333,14 +400,6 @@ export class ConversationService {
         original: data.conversationId,
         mapped: actualConversationId
       });
-
-      // Map special senderIds to agent IDs
-      let actualSenderId = data.senderId;
-      if (data.senderId === 'system') {
-        actualSenderId = this.systemAgentId;
-      } else if (data.senderId === 'user') {
-        actualSenderId = this.userAgentId;
-      }
 
       console.log('🔍 [ConversationService] Mapped senderId:', {
         original: data.senderId,

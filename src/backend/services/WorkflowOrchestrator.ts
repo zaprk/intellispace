@@ -106,7 +106,8 @@ export class WorkflowOrchestrator {
   
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
-    this.llm = new ChatOllama({ model: "llama2" });
+    // Initialize with a default model, will be overridden per agent
+    this.llm = new ChatOllama({ model: "llama3" });
   }
   
   setSocketIO(io: any) {
@@ -136,22 +137,28 @@ export class WorkflowOrchestrator {
   private parseMentions(content: string): string[] {
     const mentionedAgentIds: string[] = [];
     
+    console.log(`🔍 [MENTIONS] Parsing content: "${content}"`);
+    
     // Method 1: Standard @ mentions with word boundaries
     const standardMentions = content.match(/@([A-Za-z0-9\s\-\_]+)(?=\s|$|[^\w])/gi);
     
     if (standardMentions) {
+      console.log(`🔍 [MENTIONS] Found @ mentions: ${standardMentions.join(', ')}`);
       for (const mention of standardMentions) {
         const agentName = mention.substring(1).trim().toLowerCase();
         const matchedAgent = this.findAgentByNameOrRole(agentName);
         if (matchedAgent) {
           mentionedAgentIds.push(matchedAgent.id);
           console.log(`✅ [MENTIONS] Standard match: "${agentName}" → ${matchedAgent.name} (${matchedAgent.id})`);
+        } else {
+          console.log(`❌ [MENTIONS] No match found for: "${agentName}"`);
         }
       }
     }
 
-    // Method 2: Fallback - look for agent names/roles without @
+    // Method 2: Fallback - look for agent names/roles without @ (only if no @ mentions found)
     if (mentionedAgentIds.length === 0) {
+      console.log(`🔍 [MENTIONS] No @ mentions found, checking for agent names/roles in content`);
       for (const agent of this.agentInfo) {
         const agentNameLower = agent.name.toLowerCase();
         const agentRoleLower = agent.role.toLowerCase();
@@ -167,35 +174,15 @@ export class WorkflowOrchestrator {
       }
     }
 
-    // Method 3: Role-based keywords (designer, frontend, backend, coordinator)
-    const roleKeywords = {
-      'design': ['designer'],
-      'frontend': ['frontend-developer', 'frontend'],
-      'backend': ['backend-developer', 'backend'],
-      'coordinate': ['coordinator'],
-      'ui': ['designer'],
-      'ux': ['designer'],
-      'api': ['backend-developer'],
-      'database': ['backend-developer'],
-      'styling': ['frontend-developer'],
-      'css': ['frontend-developer'],
-      'html': ['frontend-developer'],
-      'react': ['frontend-developer']
-    };
+    // Method 3: Role-based keywords (DISABLED - only use explicit @ mentions)
+    // if (mentionedAgentIds.length === 0 && !content.includes('@')) {
+    //   console.log(`🔍 [MENTIONS] No direct mentions found, checking for keywords`);
+    //   // Keyword matching disabled to prevent false triggers
+    // }
 
-    for (const [keyword, roles] of Object.entries(roleKeywords)) {
-      if (content.toLowerCase().includes(keyword)) {
-        for (const role of roles) {
-          const agent = this.agentInfo.find(a => a.role === role);
-          if (agent && !mentionedAgentIds.includes(agent.id)) {
-            mentionedAgentIds.push(agent.id);
-            console.log(`✅ [MENTIONS] Keyword match: "${keyword}" → ${agent.name} (${agent.id})`);
-          }
-        }
-      }
-    }
-
-    return [...new Set(mentionedAgentIds)]; // Remove duplicates
+    const uniqueMentions = [...new Set(mentionedAgentIds)];
+    console.log(`📋 [MENTIONS] Final mentions: ${uniqueMentions.join(', ')}`);
+    return uniqueMentions;
   }
 
   /**
@@ -255,14 +242,19 @@ export class WorkflowOrchestrator {
   private determineProcessingMode(mentionedAgents: string[], content: string): WorkflowMode {
     console.log(`🔍 [MODE] Determining mode for ${mentionedAgents.length} mentions`);
     
-    // No mentions = Full workflow (coordinator starts)
-    if (mentionedAgents.length === 0) {
+    // Check if this is a team conversation (multiple agents available)
+    const availableAgents = this.agentInfo.filter(a => 
+      ['coordinator', 'designer', 'frontend-developer', 'backend-developer'].includes(a.role)
+    );
+    
+    // If we have multiple agents available and no specific mentions, start full team workflow
+    if (mentionedAgents.length === 0 && availableAgents.length > 1) {
       const coordinatorId = this.getAgentIdByRole('coordinator');
       return {
         type: 'full-workflow',
         agents: coordinatorId ? [coordinatorId] : [],
-        maxRounds: 3,
-        reason: 'No mentions detected, starting full team workflow'
+        maxRounds: 4,
+        reason: 'Team conversation detected - starting full team workflow'
       };
     }
     
@@ -277,11 +269,31 @@ export class WorkflowOrchestrator {
     }
     
     // Multiple mentions = Mini workflow (mentioned agents collaborate)
+    if (mentionedAgents.length > 1) {
+      return {
+        type: 'mini-workflow',
+        agents: mentionedAgents,
+        maxRounds: 2,
+        reason: `Multiple mentions detected: ${mentionedAgents.join(', ')}`
+      };
+    }
+    
+    // Fallback: Single agent available = Solo response
+    if (availableAgents.length === 1) {
+      return {
+        type: 'solo',
+        agents: [availableAgents[0].id],
+        maxRounds: 1,
+        reason: `Only one agent available: ${availableAgents[0].name}`
+      };
+    }
+    
+    // Default: No agents available
     return {
-      type: 'mini-workflow',
-      agents: mentionedAgents,
-      maxRounds: 2,
-      reason: `Multiple mentions detected: ${mentionedAgents.join(', ')}`
+      type: 'solo',
+      agents: [],
+      maxRounds: 1,
+      reason: 'No agents available'
     };
   }
 
@@ -314,33 +326,70 @@ export class WorkflowOrchestrator {
     console.log('🚀 [WORKFLOW] Starting message processing...');
     console.log(`📝 [WORKFLOW] Message content: "${message.content}"`);
     
-    // Step 1: Parse mentions with validation
-    const rawMentions = this.parseMentions(message.content);
-    const validMentions = this.validateMentionedAgents(rawMentions);
-    console.log(`🎯 [WORKFLOW] Valid mentions: ${validMentions.join(', ')}`);
-    
-    // Step 2: Determine workflow mode
-    const workflowMode = this.determineProcessingMode(validMentions, message.content);
-    console.log(`⚙️ [WORKFLOW] Mode: ${workflowMode.type} - ${workflowMode.reason}`);
-    
-    // Step 3: Initialize state
-    const state = this.initializeWorkflowState(message, workflowMode);
-    
-    // Step 4: Execute workflow based on mode
-    switch (workflowMode.type) {
-      case 'solo':
-        await this.executeSoloMode(state);
-        break;
-      case 'mini-workflow':
-        await this.executeMiniWorkflow(state);
-        break;
-      case 'full-workflow':
-        await this.executeFullWorkflow(state);
-        break;
+    try {
+      // Step 1: Parse mentions with validation
+      const rawMentions = this.parseMentions(message.content);
+      const validMentions = this.validateMentionedAgents(rawMentions);
+      console.log(`🎯 [WORKFLOW] Valid mentions: ${validMentions.join(', ')}`);
+      
+      // Step 2: Determine workflow mode
+      const workflowMode = this.determineProcessingMode(validMentions, message.content);
+      console.log(`⚙️ [WORKFLOW] Mode: ${workflowMode.type} - ${workflowMode.reason}`);
+      
+      // Step 3: Initialize state
+      const state = this.initializeWorkflowState(message, workflowMode);
+      
+      // Step 4: Execute workflow based on mode
+      switch (workflowMode.type) {
+        case 'solo':
+          await this.executeSoloMode(state);
+          break;
+        case 'mini-workflow':
+          await this.executeMiniWorkflow(state);
+          break;
+        case 'full-workflow':
+          await this.executeFullWorkflow(state);
+          break;
+      }
+      
+      console.log(`✅ [WORKFLOW] Processing complete. Final state: ${state.phase}`);
+      return state;
+    } catch (error) {
+      console.error('❌ [WORKFLOW] Error in processMessage:', error);
+      
+      // Return a state with error information
+      const errorState: SharedWorkflowState = {
+        conversationId: message.conversationId,
+        phase: 'complete',
+        userRequest: message.content,
+        sharedKnowledge: {
+          projectRequirements: '',
+          designDecisions: [],
+          technicalDecisions: [],
+          implementationNotes: [],
+          integrationPoints: [],
+          completedTasks: [],
+          blockers: []
+        },
+        agentContributions: {},
+        activeAgents: [],
+        nextAgents: [],
+        collaborationRound: 1,
+        maxRounds: 1,
+        messages: [{
+          id: `error-${Date.now()}`,
+          conversationId: message.conversationId,
+          senderId: 'system',
+          content: `Sorry, I encountered an error while processing your message: ${error.message}`,
+          type: 'text',
+          timestamp: new Date().toISOString(),
+          metadata: { error: true }
+        }],
+        error: error.message
+      };
+      
+      return errorState;
     }
-    
-    console.log(`✅ [WORKFLOW] Processing complete. Final state: ${state.phase}`);
-    return state;
   }
 
   /**
@@ -599,9 +648,16 @@ Respond naturally - this is a brief collaboration, not a full project workflow.`
     }
 
     try {
+      // Use agent's configured model
+      const agentModel = agent.config?.model || 'llama3';
+      const agentLLM = new ChatOllama({ model: agentModel });
+      
       const messages = [new HumanMessage(prompt)];
-      const response = await this.llm.invoke(messages);
+      const response = await agentLLM.invoke(messages);
       return response.content as string;
+    } catch (error) {
+      console.error(`❌ Error calling agent ${agent.name} (${agent.id}):`, error);
+      throw new Error(`Agent ${agent.name} failed to respond: ${error.message}`);
     } finally {
       // Hide typing indicator
       if (this.io) {
@@ -748,11 +804,13 @@ Respond naturally - this is a brief collaboration, not a full project workflow.`
     const prompt = isSolo 
       ? this.buildSoloPrompt(agent, state.userRequest)
       : this.buildSharedStatePrompt(agentId, agent.role, state);
-    const response = await this.llm.invoke([new HumanMessage(prompt)]);
+    
+    // Use the agent's specific model instead of the default one
+    const response = await this.callAgent(agent, prompt);
     
     try {
       // Try to extract JSON from the response
-      const content = response.content as string;
+      const content = response; // response is now a string from callAgent
       console.log(`🔍 [PARSER] Raw response from ${agentId}:`, content.substring(0, 200) + '...');
       
       // First, try to find JSON in the response
@@ -813,7 +871,7 @@ Respond naturally - this is a brief collaboration, not a full project workflow.`
       console.error(`❌ Failed to parse agent response for ${agentId}:`, error);
       
       // Final fallback contribution
-      const content = response.content as string;
+      const content = response; // response is now a string from callAgent
       const enabledAgents: string[] = [];
       if (content.includes('designer')) enabledAgents.push('designer');
       if (content.includes('frontend-developer')) enabledAgents.push('frontend-developer');
@@ -1012,23 +1070,30 @@ RESPOND WITH ONLY THIS JSON FORMAT (replace the placeholder text with your actua
   async loadAgents(): Promise<void> {
     try {
       const agents = await this.prisma.agent.findMany();
+      console.log(`🔍 [WORKFLOW] Found ${agents.length} agents in database`);
+      
       this.agents.clear();
       const uniqueAgents = new Map();
       
       agents.forEach(agent => {
         if (!uniqueAgents.has(agent.id)) {
-          const backendAgent: BackendAgent = {
-            id: agent.id,
-            name: agent.name,
-            role: agent.role,
-            description: agent.description || '',
-            status: 'online',
-            avatar: agent.avatar || undefined,
-            isActive: agent.isActive,
-            capabilities: JSON.parse(agent.capabilities),
-            config: JSON.parse(agent.config)
-          };
-          uniqueAgents.set(agent.id, backendAgent);
+          try {
+            const backendAgent: BackendAgent = {
+              id: agent.id,
+              name: agent.name,
+              role: agent.role,
+              description: agent.description || '',
+              status: 'online',
+              avatar: agent.avatar || undefined,
+              isActive: agent.isActive,
+              capabilities: JSON.parse(agent.capabilities || '[]'),
+              config: JSON.parse(agent.config || '{}')
+            };
+            uniqueAgents.set(agent.id, backendAgent);
+            console.log(`✅ [WORKFLOW] Loaded agent: ${backendAgent.name} (${backendAgent.role}) with model: ${backendAgent.config?.model || 'default'}`);
+          } catch (parseError) {
+            console.error(`❌ [WORKFLOW] Error parsing agent ${agent.id}:`, parseError);
+          }
         }
       });
       
@@ -1039,10 +1104,17 @@ RESPOND WITH ONLY THIS JSON FORMAT (replace the placeholder text with your actua
       // Update agentInfo for workflow processing
       this.agentInfo = Array.from(this.agents.values());
       
+      // Update team agents list
+      this.teamAgents = this.agentInfo
+        .filter(agent => ['coordinator', 'designer', 'frontend-developer', 'backend-developer'].includes(agent.role))
+        .map(agent => agent.id);
+      
       console.log(`✅ [WORKFLOW] Loaded ${uniqueAgents.size} agents:`, 
         Array.from(uniqueAgents.values()).map(a => `${a.name} (${a.role})`));
+      console.log(`🎯 [WORKFLOW] Team agents: ${this.teamAgents.join(', ')}`);
     } catch (error) {
       console.error('❌ [WORKFLOW] Error loading agents:', error);
+      throw error;
     }
   }
 

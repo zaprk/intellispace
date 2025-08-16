@@ -67,7 +67,7 @@ export default function App() {
   });
 
   // Update socket ref
-  socketRef.current = socket;
+    socketRef.current = socket;
 
   // Load initial data
   useEffect(() => {
@@ -100,6 +100,6 @@ export default function App() {
       <ErrorToast error={error} onClose={() => setError(null)} />
 
       <CompleteDiscordLayout />
-    </div>
-  );
+                  </div>
+                );
 }
